@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+popple-tls = { git = "ssh://git@github.com/saucisoupe/popple-tls.git" }
+rustls = "0.23"
+aws-lc-rs = "1"
+
+[dev-dependencies]
+rcgen = { version = "0.13", features = ["aws_lc_rs"] }
