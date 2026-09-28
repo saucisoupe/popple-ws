@@ -115,7 +115,6 @@ shutdown.drained().await;   // each connection bounded by close_timeout
 Driving a socket by hand, `select` on `shutdown.triggered()` and call
 `ws.close(..)`. The runtime exits the process 30 s after the signal whatever
 is left, so keep `close_timeout` and `handshake_timeout` well below that.
-`examples/echo_server.rs` does all of this.
 
 ## Configuration
 
@@ -147,8 +146,8 @@ queues, or a few slow connections starve the others on the same thread.
 ```sh
 cargo test                 # unit tests and loopback, plain and kTLS
 cargo +nightly fuzz run websocket   # and frame_decoder, roundtrip, http_head: fuzz/README.md
-autobahn/run.sh server     # Autobahn|Testsuite against examples/echo_server
-autobahn/run.sh client     # examples/autobahn_client against Autobahn
+autobahn/run.sh server     # Autobahn|Testsuite against our server
+autobahn/run.sh client     # our client against Autobahn
 ```
 
 `run.sh` uses a native `wstest` (`$WSTEST`, `~/.local/autobahn/pypy/bin/wstest`
