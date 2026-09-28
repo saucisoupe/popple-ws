@@ -1,0 +1,46 @@
+[package]
+name = "popple-ws-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+popple-ws = { path = ".." }
+runtime = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+runtime-streams = { git = "ssh://git@github.com/saucisoupe/runtime.git" }
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "websocket"
+path = "fuzz_targets/websocket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_head"
+path = "fuzz_targets/http_head.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

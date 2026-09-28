@@ -94,8 +94,7 @@ fn main() {
                     Some(cfg) => {
                         let cfg = cfg.clone();
                         spawn(async move {
-                            match popple_tls::handshake(socket, cfg, Duration::from_secs(5)).await
-                            {
+                            match popple_tls::handshake(socket, cfg, Duration::from_secs(5)).await {
                                 Ok(ktls) => {
                                     let transport = Tls::new(ktls.into_messages::<Ring>());
                                     serve(transport, &shutdown).await;

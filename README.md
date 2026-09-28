@@ -72,8 +72,9 @@ ws.send(Message::text("hello")).await?;
 
 `next()` is cancel-safe, so a single task can `select` it against its own
 events. To read and write from different tasks, `split` the socket: a driver
-task then answers pings, completes the closing handshake and interleaves both
-directions.
+task then answers pings, completes the closing handshake, and runs both
+directions at once, plain or TLS: it keeps reading while a write waits on a
+slow peer.
 
 ```rust
 let (tx, rx) = ws.split(32);      // at most 32 incoming messages wait for `rx`
@@ -129,6 +130,7 @@ memory a single connection may hold, and every duration is up to one hour.
 | `idle_timeout` | 60 s | nothing received: close with 1001, `TimedOut` |
 | `ping_interval` | 20 s | keepalive pings from `split` |
 | `close_timeout` | 5 s | wait for the peer's close frame, then drop it |
+| `write_timeout` | 30 s | a write the peer does not take fails the connection |
 | `max_outbound_bytes` | 4 MiB | `split`'s queue for a peer that does not read |
 | `allowed_origins` | any | browser `Origin` allow-list, else 403 |
 
@@ -144,6 +146,7 @@ queues, or a few slow connections starve the others on the same thread.
 
 ```sh
 cargo test                 # unit tests and loopback, plain and kTLS
+cargo +nightly fuzz run websocket   # and frame_decoder, roundtrip, http_head: fuzz/README.md
 autobahn/run.sh server     # Autobahn|Testsuite against examples/echo_server
 autobahn/run.sh client     # examples/autobahn_client against Autobahn
 ```
@@ -164,6 +167,5 @@ goes out.
 ## Status
 
 Experimental, like the runtime it builds on: Linux only, kernel 6.1 or later,
-and `modprobe tls` for kTLS. Not supported yet: permessage-deflate, a
-configurable receive queue for TLS connections (fixed by popple-tls), and a
-true split of TLS connections (writes go through the driver task).
+and `modprobe tls` for kTLS. Not supported yet: permessage-deflate, and a
+configurable receive queue for TLS connections (fixed by popple-tls).

@@ -7,7 +7,7 @@ use popple_tls::{
 };
 use popple_ws::{
     CloseFrame, Config, HandshakeError, Message, Plain, SendError, Shutdown, Tls, Transport,
-    Upgrade, WebSocket, connect, connect_tls,
+    TransportRead, TransportWrite, Upgrade, WebSocket, connect, connect_tls,
 };
 use rcgen::{CertificateParams, KeyPair};
 use runtime::net::{BufRingSpec, MultiAccept};
@@ -138,13 +138,13 @@ fn rejects_plain_http() {
         });
 
         let socket = runtime::net::connect_tcp(addr).await.unwrap();
-        let mut client = Plain::<Ring>::new(socket);
+        let (mut client_rx, mut client) = Plain::<Ring>::new(socket).into_split();
         client
             .send(&b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"[..])
             .await
             .0
             .unwrap();
-        let reply = std::future::poll_fn(|cx| client.poll_recv(cx))
+        let reply = std::future::poll_fn(|cx| client_rx.poll_recv(cx))
             .await
             .unwrap()
             .unwrap();
@@ -172,7 +172,7 @@ fn upgrade_deadline_stops_slowloris() {
         });
 
         let socket = runtime::net::connect_tcp(addr).await.unwrap();
-        let mut client = Plain::<Ring>::new(socket);
+        let (_client_rx, mut client) = Plain::<Ring>::new(socket).into_split();
         // Stops on its own once the server has dropped the connection.
         for byte in b"GET / HTTP/1.1\r\nHost: x\r\nX-Pad: "
             .iter()
@@ -235,10 +235,10 @@ fn ring_buffer_released_before_message_is_returned() {
         let server = spawn(async move {
             // A bare server, to control exactly how bytes hit the wire.
             let socket = accept.next().await.unwrap().unwrap();
-            let mut transport = Plain::<Ring>::new(socket);
+            let (mut transport_rx, mut transport) = Plain::<Ring>::new(socket).into_split();
             let mut request = Vec::new();
             while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let chunk = std::future::poll_fn(|cx| transport.poll_recv(cx))
+                let chunk = std::future::poll_fn(|cx| transport_rx.poll_recv(cx))
                     .await
                     .unwrap()
                     .unwrap();
@@ -277,12 +277,15 @@ fn ring_buffer_released_before_message_is_returned() {
 }
 
 /// Accept one upgrade by hand, answering with `extra` headers in the 101.
-async fn bare_upgrade(accept: &mut MultiAccept, extra: &str) -> Plain<Ring> {
+async fn bare_upgrade(
+    accept: &mut MultiAccept,
+    extra: &str,
+) -> (impl TransportRead, impl TransportWrite) {
     let socket = accept.next().await.unwrap().unwrap();
-    let mut transport = Plain::<Ring>::new(socket);
+    let (mut transport_rx, mut transport) = Plain::<Ring>::new(socket).into_split();
     let mut request = Vec::new();
     while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-        let chunk = std::future::poll_fn(|cx| transport.poll_recv(cx))
+        let chunk = std::future::poll_fn(|cx| transport_rx.poll_recv(cx))
             .await
             .unwrap()
             .unwrap();
@@ -299,7 +302,7 @@ async fn bare_upgrade(accept: &mut MultiAccept, extra: &str) -> Plain<Ring> {
         popple_ws::handshake::accept_key(key)
     );
     transport.send(response.into_bytes()).await.0.unwrap();
-    transport
+    (transport_rx, transport)
 }
 
 fn quiet(idle: Duration, ping: Option<Duration>) -> Config {
@@ -601,6 +604,125 @@ fn shutdown_does_not_wait_past_close_timeout() {
             "{elapsed:?}"
         );
         server.await;
+    });
+}
+
+/// Large enough to fill both sides' socket buffers, and block a write.
+const JAM: usize = 16 << 20;
+
+fn jam_config() -> Config {
+    Config {
+        max_frame_size: 32 << 20,
+        max_message_size: 32 << 20,
+        max_outbound_bytes: 64 << 20,
+        ..Config::default()
+    }
+}
+
+/// The server echoes a message too large for the client, who does not read,
+/// to take: its write stays stuck. It must still read what comes next.
+async fn reads_while_writing<T: Transport + 'static>(ws: WebSocket<T>) {
+    let (tx, rx) = ws.split(8);
+    let jam = rx.recv().await.unwrap().unwrap();
+    assert_eq!(jam.payload_len(), JAM);
+    // Not `unwrap`: its error holds the 16 MiB message.
+    assert!(tx.send(jam).is_ok(), "connection over before the echo");
+    // With reads and writes taking turns, this would wait on the echo.
+    let next = timeout(Duration::from_secs(2), rx.recv()).await;
+    let next = next.expect("no read while the write was stuck");
+    assert_eq!(next.unwrap().unwrap(), Message::text("still there?"));
+}
+
+/// Returns the socket, to keep it open until the server is done.
+async fn jam_then_talk<T: Transport>(mut ws: WebSocket<T>) -> WebSocket<T> {
+    ws.send(Message::Binary(vec![7; JAM])).await.unwrap();
+    // Never read: the echo fills our buffers, then the server's.
+    ws.send(Message::text("still there?")).await.unwrap();
+    ws
+}
+
+#[test]
+fn reads_go_on_while_a_write_is_stuck() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let upgrade = Upgrade::read(Plain::<Ring>::new(socket), jam_config()).await;
+            reads_while_writing(upgrade.unwrap().accept().await.unwrap()).await;
+        });
+        let (ws, _) = connect::<Ring>(addr, "localhost", "/", jam_config())
+            .await
+            .unwrap();
+        let _open = jam_then_talk(ws).await;
+        server.await;
+    });
+}
+
+#[test]
+fn tls_reads_go_on_while_a_write_is_stuck() {
+    if !popple_tls::ktls_available() {
+        eprintln!("kTLS unavailable (modprobe tls); skipping");
+        return;
+    }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let (cert, key) = self_signed();
+    let server_tls = server_config(ServerSettings {
+        certs: vec![cert],
+        key,
+        alpn_protocols: None,
+    })
+    .unwrap();
+    let client_tls = client_config_dangerous_no_verification(None).unwrap();
+    runtime::main_thread_with::<Ring, _>(async move {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let deadline = Duration::from_secs(5);
+            let ktls = popple_tls::handshake(socket, server_tls, deadline)
+                .await
+                .unwrap();
+            let transport = Tls::new(ktls.into_messages::<Ring>());
+            let upgrade = Upgrade::read(transport, jam_config()).await.unwrap();
+            reads_while_writing(upgrade.accept().await.unwrap()).await;
+        });
+        let name = ServerName::try_from("localhost").unwrap();
+        let (ws, _) = connect_tls::<Ring>(addr, name, client_tls, "/", jam_config())
+            .await
+            .unwrap();
+        let _open = jam_then_talk(ws).await;
+        server.await;
+    });
+}
+
+/// A peer that stops reading does not hold the connection past
+/// `write_timeout`.
+#[test]
+fn a_peer_that_does_not_read_times_out() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let config = Config {
+                write_timeout: Duration::from_millis(300),
+                ..jam_config()
+            };
+            let upgrade = Upgrade::read(Plain::<Ring>::new(socket), config).await;
+            let (tx, rx) = upgrade.unwrap().accept().await.unwrap().split(8);
+            let started = Instant::now();
+            tx.send(Message::Binary(vec![1; JAM])).unwrap();
+            let error = rx.recv().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            started.elapsed()
+        });
+        // Connects, then never reads.
+        let (_ws, _) = connect::<Ring>(addr, "localhost", "/", jam_config())
+            .await
+            .unwrap();
+        let elapsed = server.await;
+        assert!(
+            (Duration::from_millis(280)..Duration::from_secs(2)).contains(&elapsed),
+            "{elapsed:?}"
+        );
     });
 }
 

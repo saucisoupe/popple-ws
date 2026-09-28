@@ -442,7 +442,7 @@ fn parse_close(payload: &[u8]) -> Result<Option<CloseFrame>, ProtocolError> {
 }
 
 /// Codes a peer may put on the wire (§7.4.1, §7.4.2).
-fn valid_close_code(code: u16) -> bool {
+pub(crate) fn valid_close_code(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 

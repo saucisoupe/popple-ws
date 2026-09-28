@@ -1,15 +1,16 @@
 use std::cell::Cell;
+use std::future::poll_fn;
 use std::io;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::time::Duration;
 
 use runtime::channels::{
     BoundedReceiver, BoundedSender, Receiver, Sender, bounded_channel, unbounded_channel,
 };
-use runtime::runtime::select::{SelectResult4, select4};
+use runtime::runtime::select::{SelectResult5, select5};
 use runtime::runtime::time::Sleep;
 use runtime::spawn;
-use runtime_streams::StreamExt;
 
 use crate::control::ControlBuf;
 use crate::message::{CloseFrame, Message};
@@ -131,6 +132,17 @@ async fn drive<T: Transport>(
     drop(outbound);
 }
 
+/// What one write carries: messages from the senders, a keepalive ping, a
+/// close; always followed by the pongs and close reply reading owes.
+struct Job {
+    batch: Vec<Message>,
+    ping: bool,
+    close: Option<Option<CloseFrame>>,
+}
+
+// The write half is borrowed across awaits on purpose: by the write in
+// flight, its only holder, and on the way out once `finish` has ended it.
+#[allow(clippy::await_holding_refcell_ref)]
 async fn pump<T: Transport>(
     ws: &mut WebSocket<T>,
     outbound: &Receiver<Message>,
@@ -139,17 +151,53 @@ async fn pump<T: Transport>(
 ) -> io::Result<()> {
     let ping_interval = ws.config().ping_interval;
     let mut keepalive = ping_interval.map(Sleep::during);
-    let mut outbound_open = true;
     // Built once and kept: a select loop re-polls it without re-registering.
     let mut stop = ws.watched().map(|shutdown| Box::pin(shutdown.triggered()));
+    let (read, write, state) = ws.parts();
+
+    // One write at a time, kept in flight across turns of the loop, so the
+    // socket is read while the peer takes its time with what we send.
+    let run = |job: Job| async move {
+        let mut writer = write.borrow_mut();
+        let size: usize = job.batch.iter().map(Message::payload_len).sum();
+        shared.queued.set(shared.queued.get() - size);
+        for message in job.batch {
+            // Nothing may follow our close frame: what was queued is dropped.
+            if state.close_sent() {
+                break;
+            }
+            writer.feed(state, message).await?;
+        }
+        if job.ping && !state.close_sent() {
+            writer.feed(state, Message::Ping(ControlBuf::new())).await?;
+        }
+        match job.close {
+            Some(frame) if !state.close_sent() => writer.close(state, frame).await,
+            _ => writer.flush(state).await,
+        }
+    };
+    let mut writing = pin!(None);
+    let mut close_next: Option<Option<CloseFrame>> = None;
+    let mut ping_next = false;
+    let mut outbound_open = true;
+
     loop {
+        let busy = writing.is_some();
         // `next` is cancel-safe, so losing the race to the others costs nothing.
-        let event = select4(
-            ws.next(),
+        let event = select5(
+            poll_fn(|cx| read.poll_next(state, cx)),
             async {
-                match outbound_open {
+                // Taken only when the writer is free: the rest waits in the
+                // channel, within the senders' budget.
+                match outbound_open && !busy {
                     true => outbound.recv_all().await,
                     false => std::future::pending().await,
+                }
+            },
+            async {
+                match writing.as_mut().as_pin_mut() {
+                    Some(job) => job.await,
+                    None => std::future::pending().await,
                 }
             },
             async {
@@ -167,64 +215,77 @@ async fn pump<T: Transport>(
         )
         .await;
         match event {
-            SelectResult4::First(Some(Ok(message))) => {
-                // Pongs owed by what one read brought in leave together, once
-                // its last message is out.
-                if !ws.has_ready() {
-                    ws.flush().await?;
-                }
+            SelectResult5::First(Some(Ok(message))) => {
                 if inbound.send(Ok(message)).await.is_err() {
                     // Nobody listens any more.
-                    return ws.close(None).await;
+                    finish(writing.as_mut()).await;
+                    return write.borrow_mut().close(state, None).await;
                 }
             }
-            SelectResult4::First(Some(Err(e))) if e.kind() == io::ErrorKind::WouldBlock => {
+            SelectResult5::First(Some(Err(e))) if e.kind() == io::ErrorKind::WouldBlock => {
                 // The ring is drained by other holders on this thread.
                 Sleep::during(Duration::from_millis(1)).await;
             }
-            SelectResult4::First(Some(Err(e))) => return Err(e),
-            SelectResult4::First(None) => return ws.flush().await,
-            SelectResult4::Second(Some(messages)) if ws.is_closing() => {
-                // Nothing may follow our close frame: what was queued is dropped.
-                let size: usize = messages.iter().map(Message::payload_len).sum();
-                shared.queued.set(shared.queued.get() - size);
+            SelectResult5::First(Some(Err(e))) => {
+                // The close it owes goes out with `drive`'s last flush.
+                finish(writing.as_mut()).await;
+                return Err(e);
             }
-            SelectResult4::Second(Some(messages)) => {
-                // The whole batch in one write.
-                for message in messages {
-                    let size = message.payload_len();
-                    let fed = ws.feed(message).await;
-                    shared.queued.set(shared.queued.get() - size);
-                    fed?;
-                }
-                ws.flush().await?;
+            SelectResult5::First(None) => {
+                finish(writing.as_mut()).await;
+                return write.borrow_mut().flush(state).await;
             }
-            SelectResult4::Second(None) => {
+            SelectResult5::Second(Some(batch)) => {
+                writing.set(Some(run(Job {
+                    batch,
+                    ping: false,
+                    close: None,
+                })));
+            }
+            SelectResult5::Second(None) => {
                 outbound_open = false;
-                ws.close(None).await?;
+                close_next.get_or_insert(None);
             }
-            SelectResult4::Fourth(()) => {
+            SelectResult5::Third(result) => {
+                writing.set(None);
+                result?;
+            }
+            SelectResult5::Fourth(()) => {
+                let interval = ping_interval.expect("ticks only with an interval");
+                keepalive = Some(Sleep::during(interval));
+                // Only a quiet peer is pinged; its pong resets the idle clock.
+                ping_next = read.idle_for() >= interval;
+            }
+            SelectResult5::Fifth(()) => {
                 // Once only: the future stays ready.
                 stop = None;
                 // Refuse new messages, say goodbye, and keep reading until the
                 // peer answers our close or `close_timeout` passes.
                 shared.done.set(true);
-                if !ws.is_closing() {
-                    ws.close(Some(CloseFrame {
-                        code: 1001,
-                        reason: "server shutting down".to_owned(),
-                    }))
-                    .await?;
-                }
-            }
-            SelectResult4::Third(()) => {
-                let interval = ping_interval.expect("ticks only with an interval");
-                keepalive = Some(Sleep::during(interval));
-                // Only a quiet peer is pinged; its pong resets the idle clock.
-                if ws.idle_for() >= interval && !ws.is_closing() {
-                    ws.send(Message::Ping(ControlBuf::new())).await?;
-                }
+                close_next = Some(Some(CloseFrame {
+                    code: 1001,
+                    reason: "server shutting down".to_owned(),
+                }));
             }
         }
+        // The writer is free: send what is due, and the pongs of what one
+        // read brought in once it is all read.
+        let owed = state.owes() && !read.has_ready();
+        if writing.is_none() && (close_next.is_some() || ping_next || owed) {
+            writing.set(Some(run(Job {
+                batch: Vec::new(),
+                ping: std::mem::take(&mut ping_next),
+                close: close_next.take(),
+            })));
+        }
+    }
+}
+
+/// Let a write in flight complete: dropping it mid-frame would spend the
+/// socket. Its error, if any, shows on the next write.
+async fn finish<F: Future<Output = io::Result<()>>>(mut writing: Pin<&mut Option<F>>) {
+    if let Some(job) = writing.as_mut().as_pin_mut() {
+        let _ = job.await;
+        writing.set(None);
     }
 }

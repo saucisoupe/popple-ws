@@ -8,7 +8,7 @@ use std::time::Duration;
 use runtime::runtime::time::{Sleep, timeout};
 
 use crate::socket::{Config, InvalidConfig, Role, WebSocket};
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportRead, TransportWrite};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -140,7 +140,8 @@ impl Head {
 /// inspect the path and headers, then [`accept`](Self::accept) or
 /// [`reject`](Self::reject).
 pub struct Upgrade<T: Transport> {
-    transport: T,
+    reader: T::Reader,
+    writer: T::Writer,
     head: Head,
     key: String,
     leftover: Vec<u8>,
@@ -152,8 +153,9 @@ impl<T: Transport> Upgrade<T> {
     /// on timeout the transport is dropped, which closes the connection. A
     /// request that is not a valid upgrade is answered (400, or 426 for an
     /// unsupported version) before the error is returned.
-    pub async fn read(mut transport: T, config: Config) -> Result<Self, HandshakeError> {
-        let (raw, leftover) = within(&config, read_head(&mut transport)).await?;
+    pub async fn read(transport: T, config: Config) -> Result<Self, HandshakeError> {
+        let (mut reader, mut writer) = transport.into_split();
+        let (raw, leftover) = within(&config, read_head(&mut reader)).await?;
         let checked = match Head::parse(&raw) {
             Ok(head) => match validate_request(&head, &config) {
                 Ok(key) => Ok((key.to_owned(), head)),
@@ -164,7 +166,8 @@ impl<T: Transport> Upgrade<T> {
         };
         match checked {
             Ok((key, head)) => Ok(Self {
-                transport,
+                reader,
+                writer,
                 key,
                 head,
                 leftover,
@@ -184,8 +187,8 @@ impl<T: Transport> Upgrade<T> {
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 );
-                let _ = transport.send(response.into_bytes()).await;
-                let _ = transport.shutdown().await;
+                let _ = writer.send(response.into_bytes()).await;
+                let _ = writer.shutdown().await;
                 Err(HandshakeError::Invalid(why))
             }
         }
@@ -242,9 +245,10 @@ impl<T: Transport> Upgrade<T> {
              Sec-WebSocket-Accept: {}\r\n{protocol}\r\n",
             accept_key(&self.key),
         );
-        self.transport.send(response.into_bytes()).await.0?;
-        Ok(WebSocket::from_upgraded(
-            self.transport,
+        self.writer.send(response.into_bytes()).await.0?;
+        Ok(WebSocket::from_halves(
+            self.reader,
+            self.writer,
             Role::Server,
             self.leftover,
             self.config,
@@ -262,8 +266,8 @@ impl<T: Transport> Upgrade<T> {
         }
         let response =
             format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        self.transport.send(response.into_bytes()).await.0?;
-        self.transport.shutdown().await
+        self.writer.send(response.into_bytes()).await.0?;
+        self.writer.shutdown().await
     }
 }
 
@@ -307,25 +311,24 @@ fn validate_request<'h>(head: &'h Head, config: &Config) -> Result<&'h str, (u16
 /// `config.handshake_timeout`. `headers` are sent as is, e.g.
 /// `[("Sec-WebSocket-Protocol", "chat")]`.
 pub async fn client<T: Transport>(
-    mut transport: T,
+    transport: T,
     host: &str,
     path: &str,
     headers: &[(&str, &str)],
     config: Config,
 ) -> Result<(WebSocket<T>, Head), HandshakeError> {
-    let (head, leftover) = within(
-        &config,
-        client_exchange(&mut transport, host, path, headers),
-    )
-    .await?;
-    let ws = WebSocket::from_upgraded(transport, Role::Client, leftover, config);
+    let (mut reader, mut writer) = transport.into_split();
+    let exchange = client_exchange(&mut reader, &mut writer, host, path, headers);
+    let (head, leftover) = within(&config, exchange).await?;
+    let ws = WebSocket::from_halves(reader, writer, Role::Client, leftover, config);
     Ok((ws, head))
 }
 
 /// Send the upgrade request and check the response; returns the response
 /// head and what followed it.
-async fn client_exchange<T: Transport>(
-    transport: &mut T,
+async fn client_exchange<R: TransportRead, W: TransportWrite>(
+    reader: &mut R,
+    writer: &mut W,
     host: &str,
     path: &str,
     headers: &[(&str, &str)],
@@ -342,10 +345,16 @@ async fn client_exchange<T: Transport>(
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     request.push_str("\r\n");
-    transport.send(request.into_bytes()).await.0?;
+    writer.send(request.into_bytes()).await.0?;
 
-    let (raw, leftover) = read_head(transport).await?;
+    let (raw, leftover) = read_head(reader).await?;
     let head = Head::parse(&raw)?;
+    check_response(&head, &key, headers)?;
+    Ok((head, leftover))
+}
+
+/// Whether a response upgrades the request sent with `key` and `headers`.
+fn check_response(head: &Head, key: &str, headers: &[(&str, &str)]) -> Result<(), HandshakeError> {
     let status = head
         .start_line
         .split(' ')
@@ -360,7 +369,7 @@ async fn client_exchange<T: Transport>(
             "response does not upgrade to websocket",
         ));
     }
-    if head.header("sec-websocket-accept") != Some(accept_key(&key).as_str()) {
+    if head.header("sec-websocket-accept") != Some(accept_key(key).as_str()) {
         return Err(HandshakeError::Invalid("wrong Sec-WebSocket-Accept"));
     }
     // We offer no extension, and only the subprotocols the caller listed
@@ -382,7 +391,7 @@ async fn client_exchange<T: Transport>(
             ));
         }
     }
-    Ok((head, leftover))
+    Ok(())
 }
 
 /// Refuse what would break out of the request line or a header: the caller
@@ -436,10 +445,10 @@ fn is_field_value(s: &str) -> bool {
 
 /// Read up to the blank line ending an HTTP head. Returns the head and the
 /// bytes that followed it.
-async fn read_head<T: Transport>(transport: &mut T) -> Result<(Vec<u8>, Vec<u8>), HandshakeError> {
+async fn read_head<R: TransportRead>(reader: &mut R) -> Result<(Vec<u8>, Vec<u8>), HandshakeError> {
     let mut buf = Vec::new();
     loop {
-        let chunk = match std::future::poll_fn(|cx| transport.poll_recv(cx)).await {
+        let chunk = match std::future::poll_fn(|cx| reader.poll_recv(cx)).await {
             Some(Ok(chunk)) => chunk,
             Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                 Sleep::during(Duration::from_millis(1)).await;
@@ -464,6 +473,67 @@ async fn read_head<T: Transport>(transport: &mut T) -> Result<(Vec<u8>, Vec<u8>)
         }
         if buf.len() > MAX_HEAD {
             return Err(HandshakeError::Invalid("head too large"));
+        }
+    }
+}
+
+/// Entry points for `fuzz/`, built only under `cargo fuzz`: the parts of the
+/// upgrade that read untrusted bytes, with the invariants they must keep.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz {
+    use std::collections::VecDeque;
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    /// Parse a head, then run on it every check requests and responses get.
+    pub fn head(raw: &[u8]) {
+        let Ok(head) = Head::parse(raw) else { return };
+        // What smuggles a header must never survive parsing.
+        for (name, value) in &head.headers {
+            assert!(is_token(name), "{name:?}");
+            assert!(is_field_value(value), "{value:?}");
+        }
+        assert!(is_field_value(&head.start_line));
+        let config = Config {
+            allowed_origins: &["https://a.example"],
+            ..Config::default()
+        };
+        let _ = validate_request(&head, &config);
+        let offered = [("Sec-WebSocket-Protocol", "chat, superchat")];
+        let _ = check_response(&head, "dGhlIHNhbXBsZSBub25jZQ==", &offered);
+        let path = head.start_line.split(' ').nth(1).unwrap_or("/");
+        let host = head.header("host").unwrap_or("h");
+        let _ = validate_client_request(host, path, &[]);
+    }
+
+    /// Read a head out of `chunks` as the transport delivers them.
+    pub fn read(chunks: Vec<Vec<u8>>) {
+        let input: Vec<u8> = chunks.concat();
+        let mut transport = Chunks(chunks.into());
+        let mut read = std::pin::pin!(read_head(&mut transport));
+        let Poll::Ready(result) = read.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            unreachable!("Chunks never waits");
+        };
+        if let Ok((head, leftover)) = result {
+            // The head ends at the first blank line, and nothing is lost.
+            let end = head.len();
+            assert!(head.ends_with(b"\r\n\r\n"));
+            assert!(!head[..end - 1].windows(4).any(|w| w == b"\r\n\r\n"));
+            assert!(input.starts_with(&[head, leftover].concat()));
+        }
+    }
+
+    /// Delivers its chunks, then ends.
+    struct Chunks(VecDeque<Vec<u8>>);
+
+    impl TransportRead for Chunks {
+        type Chunk = Vec<u8>;
+
+        fn poll_recv(&mut self, _: &mut Context<'_>) -> Poll<Option<io::Result<Vec<u8>>>> {
+            Poll::Ready(self.0.pop_front().map(Ok))
         }
     }
 }

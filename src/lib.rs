@@ -35,4 +35,4 @@ pub use message::{CloseFrame, Message};
 pub use shutdown::Shutdown;
 pub use socket::{Config, InvalidConfig, Role, WebSocket};
 pub use split::{SendError, WsReceiver, WsSender};
-pub use transport::{Plain, Tls, Transport};
+pub use transport::{Plain, Tls, Transport, TransportRead, TransportWrite};

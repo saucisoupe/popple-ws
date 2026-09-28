@@ -29,6 +29,7 @@ const CONFIG: Config = Config {
     idle_timeout: None,
     ping_interval: None,
     close_timeout: Duration::from_secs(5),
+    write_timeout: Duration::from_secs(30),
     max_outbound_bytes: 16 << 20,
     allowed_origins: &[],
 };
