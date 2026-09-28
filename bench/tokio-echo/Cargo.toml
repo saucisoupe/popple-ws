@@ -1,0 +1,22 @@
+[package]
+name = "tokio-echo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Reference echo servers on tokio, for bench/run.sh to compare popple-ws
+# against. A crate of its own, so none of this reaches popple-ws.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+fastwebsockets = { version = "0.10", features = ["upgrade"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = { version = "0.13", features = ["aws_lc_rs"] }
+
+[profile.release]
+debug = true
