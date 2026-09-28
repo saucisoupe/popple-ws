@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "async_timers"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#a99707818f7c960b74be57586ba0faf4d4b805e9"
 
 [[package]]
 name = "aws-lc-rs"
@@ -106,7 +106,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -157,7 +157,7 @@ dependencies = [
 [[package]]
 name = "io_uring_rb"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#a99707818f7c960b74be57586ba0faf4d4b805e9"
 dependencies = [
  "io-uring",
  "rustix",
@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "runtime"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#a99707818f7c960b74be57586ba0faf4d4b805e9"
 dependencies = [
  "libc",
  "mimalloc",
@@ -392,7 +392,7 @@ dependencies = [
 [[package]]
 name = "runtime-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#a99707818f7c960b74be57586ba0faf4d4b805e9"
 dependencies = [
  "async_timers",
  "bitfield-struct",
@@ -411,7 +411,7 @@ dependencies = [
 [[package]]
 name = "runtime-streams"
 version = "0.1.0"
-source = "git+ssh://git@github.com/saucisoupe/runtime.git#3820bc833803f95d5d58e79c7f1f15aab440a67f"
+source = "git+ssh://git@github.com/saucisoupe/runtime.git#a99707818f7c960b74be57586ba0faf4d4b805e9"
 
 [[package]]
 name = "rustix"
@@ -423,7 +423,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

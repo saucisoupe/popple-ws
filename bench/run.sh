@@ -19,8 +19,8 @@ IMPLS=${IMPLS:-popple tungstenite fastwebsockets}
 TLS=${TLS:-plain tls}
 SECS=${SECS:-5}
 WARMUP=${WARMUP:-3}
-# A port per run: the last server's connections linger in TIME_WAIT on its
-# port, and a listener without SO_REUSEADDR cannot bind it again.
+# A port per run, so a run never meets the last server's connections still
+# lingering in TIME_WAIT on its port.
 PORT=${PORT:-9100}
 # conns:depth:size
 CASES=${CASES:-100:1:64 100:16:64 100:1:4096 100:1:65536 10000:1:64}
