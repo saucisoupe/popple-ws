@@ -1,8 +1,10 @@
 use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime};
+
+use runtime::runtime::time::Sleep;
 
 use runtime_streams::Stream;
 
@@ -12,9 +14,21 @@ use crate::frame::{apply_mask, encode_header};
 use crate::message::{CloseFrame, Message};
 use crate::transport::Transport;
 
-/// Payloads up to this size are copied behind their header and sent in one
-/// buffer; larger ones go out as a two-buffer gather send, uncopied.
+/// Payloads up to this size are copied into the inline segment, behind their
+/// header; larger ones go out as segments of their own, uncopied.
 const INLINE_PAYLOAD: usize = 4096;
+
+/// `feed` writes once this much is pending, so a caller that never flushes
+/// still holds a bounded amount.
+const FLUSH_THRESHOLD: usize = 64 << 10;
+
+/// Emptied segments kept per connection, and the capacity each keeps: enough
+/// for a burst of small frames, little across ten thousand connections.
+const MAX_SPARES: usize = 2;
+
+/// Pongs owed at most, each up to 125 bytes.
+const MAX_PENDING_PONGS: usize = 16;
+const SPARE_CAPACITY: usize = 16 << 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -28,26 +42,53 @@ pub enum Role {
 /// re-exported); a longer sleep panics on its first poll.
 const MAX_TIMER: Duration = Duration::from_secs(60 * 60);
 
+/// Every duration is up to one hour, the longest timer the runtime serves.
+/// The defaults suit a server facing untrusted peers; each size limit is also
+/// memory a single connection may pin.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// Largest single data frame accepted; a bigger one fails the connection
-    /// with close code 1009 as soon as its header is read.
+    /// with close code 1009 as soon as its header is read. Default 1 MiB.
     pub max_frame_size: usize,
     /// Largest reassembled message accepted, across all its fragments; a
-    /// bigger one fails the connection with close code 1009.
+    /// bigger one fails the connection with close code 1009. Default 4 MiB.
     pub max_message_size: usize,
     /// One deadline for the whole HTTP upgrade, not per read, so a peer
-    /// dripping bytes cannot stretch it. Up to one hour; the 5 s default is
-    /// also the runtime's cheapest timer.
+    /// dripping bytes cannot stretch it. Default 5 s, also the runtime's
+    /// cheapest timer.
     pub handshake_timeout: Duration,
+    /// A connection that receives nothing for this long fails with
+    /// `TimedOut`, and the peer is sent close code 1001. `None` keeps silent
+    /// peers forever. Default 60 s.
+    pub idle_timeout: Option<Duration>,
+    /// With [`split`](WebSocket::split), a ping goes out after this long
+    /// without receiving anything, so a live but quiet peer answers and
+    /// stays under `idle_timeout`. Default 20 s.
+    pub ping_interval: Option<Duration>,
+    /// How long to wait for the peer's close frame once ours is sent, before
+    /// dropping the connection. Default 5 s.
+    pub close_timeout: Duration,
+    /// With [`split`](WebSocket::split), payload bytes queued for a peer that
+    /// does not read them; past this, sends are refused. Default 4 MiB.
+    pub max_outbound_bytes: usize,
+    /// Servers: when not empty, the upgrade is refused with 403 unless the
+    /// request's `Origin` is one of these, compared case-insensitively, e.g.
+    /// `"https://example.com"`. A request without `Origin` does not come from
+    /// a browser and is let through. Default: every origin.
+    pub allowed_origins: &'static [&'static str],
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_frame_size: 16 << 20,
-            max_message_size: 64 << 20,
+            max_frame_size: 1 << 20,
+            max_message_size: 4 << 20,
             handshake_timeout: Duration::from_secs(5),
+            idle_timeout: Some(Duration::from_secs(60)),
+            ping_interval: Some(Duration::from_secs(20)),
+            close_timeout: Duration::from_secs(5),
+            max_outbound_bytes: 4 << 20,
+            allowed_origins: &[],
         }
     }
 }
@@ -56,13 +97,19 @@ impl Config {
     /// Check the settings the runtime would otherwise reject mid-connection.
     /// The handshakes call it too, but calling it at startup fails earlier.
     pub fn validate(&self) -> Result<(), InvalidConfig> {
-        if self.handshake_timeout > MAX_TIMER {
-            return Err(InvalidConfig("handshake_timeout is over one hour"));
+        let timer = |d: Duration| !d.is_zero() && d <= MAX_TIMER;
+        if !timer(self.handshake_timeout) || !timer(self.close_timeout) {
+            return Err(InvalidConfig("a timeout is zero or over one hour"));
         }
-        if self.handshake_timeout.is_zero() {
-            return Err(InvalidConfig("handshake_timeout is zero"));
+        if !self.idle_timeout.is_none_or(timer) || !self.ping_interval.is_none_or(timer) {
+            return Err(InvalidConfig("a timeout is zero or over one hour"));
         }
-        if self.max_frame_size == 0 || self.max_message_size == 0 {
+        if let (Some(ping), Some(idle)) = (self.ping_interval, self.idle_timeout)
+            && ping >= idle
+        {
+            return Err(InvalidConfig("ping_interval must be under idle_timeout"));
+        }
+        if self.max_frame_size == 0 || self.max_message_size == 0 || self.max_outbound_bytes == 0 {
             return Err(InvalidConfig("a size limit is zero"));
         }
         Ok(())
@@ -102,7 +149,9 @@ pub struct WebSocket<T: Transport> {
     /// error that stopped decoding, if one did.
     ready: VecDeque<Message>,
     failed: Option<ProtocolError>,
-    pending_pong: Option<ControlBuf>,
+    /// Pongs owed, one per ping, oldest first; past `MAX_PENDING_PONGS` the
+    /// oldest are dropped, as §5.5.3 allows, so a ping flood stays bounded.
+    pending_pongs: VecDeque<ControlBuf>,
     /// Close frame owed to the peer: the echo of theirs, or our protocol error.
     pending_close: Option<Option<CloseFrame>>,
     close_sent: bool,
@@ -110,14 +159,38 @@ pub struct WebSocket<T: Transport> {
     read_done: bool,
     /// Set while a frame is being written; still set means one was cancelled.
     writing: bool,
-    /// Reused by every data frame: the whole frame when it is small, its
-    /// header alone otherwise. Never grows past `INLINE_PAYLOAD` plus a header.
-    send_buf: Vec<u8>,
-    /// Reused chunk list for gather sends: `[header, payload]`, emptied after.
-    send_bufs: Vec<Vec<u8>>,
+    /// Frames fed and not yet written, in order. Small frames and the
+    /// headers of large ones are packed into inline segments; a large payload
+    /// is a segment of its own, never copied.
+    out: Vec<Vec<u8>>,
+    /// Whether the last segment of `out` is inline: small frames join it.
+    inline_open: bool,
+    /// Bytes in `out`.
+    out_bytes: usize,
+    /// Emptied segments, reused for the next frames.
+    spare: Vec<Vec<u8>>,
+    /// Our side was shut down once the closing handshake completed.
+    shut_down: bool,
+    config: Config,
+    /// When data last came in; stamped on the first poll, since the clock is
+    /// only readable inside the runtime.
+    last_received: Option<SystemTime>,
+    /// When our close frame went out, as first seen by a poll.
+    closing_since: Option<SystemTime>,
+    /// Armed for the nearest deadline; when it fires the deadline is worked
+    /// out again, so incoming data never re-arms it.
+    timer: Option<Sleep>,
 }
 
 impl<T: Transport> Unpin for WebSocket<T> {}
+
+/// Where [`WebSocket::queue_data`] put a payload.
+enum Queued {
+    /// Copied into the inline segment: the buffer is free, handed back.
+    Copied(Vec<u8>),
+    /// A segment of its own, at this index of `out`, until written.
+    Segment(usize),
+}
 
 impl<T: Transport> WebSocket<T> {
     /// Wrap a transport whose HTTP upgrade is already done. `leftover` is
@@ -134,15 +207,31 @@ impl<T: Transport> WebSocket<T> {
             leftover: (!leftover.is_empty()).then_some(leftover),
             ready: VecDeque::new(),
             failed: None,
-            pending_pong: None,
+            pending_pongs: VecDeque::new(),
             pending_close: None,
             close_sent: false,
             close_received: false,
             read_done: false,
             writing: false,
-            send_buf: Vec::new(),
-            send_bufs: Vec::with_capacity(2),
+            out: Vec::new(),
+            inline_open: false,
+            out_bytes: 0,
+            spare: Vec::new(),
+            shut_down: false,
+            config,
+            last_received: None,
+            closing_since: None,
+            timer: None,
         }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// How long since data last came in. Zero before the first poll.
+    pub fn idle_for(&self) -> Duration {
+        self.last_received.map_or(Duration::ZERO, elapsed_since)
     }
 
     pub fn role(&self) -> Role {
@@ -153,22 +242,63 @@ impl<T: Transport> WebSocket<T> {
         &self.transport
     }
 
+    /// Our close frame is out: nothing else may be sent.
+    pub fn is_closing(&self) -> bool {
+        self.close_sent
+    }
+
     /// Both sides have sent their close frame.
     pub fn is_closed(&self) -> bool {
         self.close_sent && self.close_received
     }
 
-    /// Send a message, after any pong or close reply still owed. Sending a
-    /// [`Message::Close`] starts the closing handshake like [`close`](Self::close).
-    pub async fn send(&mut self, message: Message) -> io::Result<()> {
-        self.ready_to_send().await?;
+    /// Whether `next()` has a message, or the error that ended reading,
+    /// already decoded: then it returns without waiting. An echo or a proxy
+    /// feeds replies while this holds and flushes once it no longer does, so
+    /// what one read brought in goes back out in one write.
+    pub fn has_ready(&self) -> bool {
+        !self.ready.is_empty() || self.failed.is_some() || self.leftover.is_some()
+    }
+
+    /// Queue a message behind those fed before it. Nothing is written until
+    /// [`flush`](Self::flush), or until `FLUSH_THRESHOLD` bytes are pending,
+    /// so a burst of messages leaves in one write, and with kTLS in as few
+    /// TLS records. A [`Message::Close`] starts the closing handshake.
+    pub async fn feed(&mut self, message: Message) -> io::Result<()> {
+        self.ready_to_feed()?;
         match message {
-            Message::Text(text) => self.write_frame(OpCode::Text, text.into_bytes()).await.0,
-            Message::Binary(data) => self.write_frame(OpCode::Binary, data).await.0,
-            Message::Ping(data) => self.write_control(OpCode::Ping, data).await,
-            Message::Pong(data) => self.write_control(OpCode::Pong, data).await,
-            Message::Close(frame) => self.write_close(frame).await,
+            // The payload is the message's: whether copied or queued, it is
+            // not handed back.
+            Message::Text(text) => drop(self.queue_data(OpCode::Text, text.into_bytes())),
+            Message::Binary(data) => drop(self.queue_data(OpCode::Binary, data)),
+            Message::Ping(payload) => self.queue_inline(OpCode::Ping, &payload),
+            Message::Pong(payload) => self.queue_inline(OpCode::Pong, &payload),
+            Message::Close(frame) => self.queue_close(frame),
         }
+        if self.out_bytes >= FLUSH_THRESHOLD {
+            self.write_out(None).await.0?;
+        }
+        Ok(())
+    }
+
+    /// Write everything fed so far, with the pong and close reply reading
+    /// left owed, in a single write.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        self.queue_owed();
+        self.write_out(None).await.0?;
+        // Both close frames are out: the handshake is over, so is our side.
+        if self.close_sent && self.close_received && !self.shut_down {
+            self.shut_down = true;
+            self.transport.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// Feed then flush: the message, and whatever was fed before it, leave
+    /// in one write.
+    pub async fn send(&mut self, message: Message) -> io::Result<()> {
+        self.feed(message).await?;
+        self.flush().await
     }
 
     /// Send a binary message and get its buffer back to fill the next one.
@@ -190,15 +320,42 @@ impl<T: Transport> WebSocket<T> {
     }
 
     async fn send_data(&mut self, opcode: OpCode, payload: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
-        match self.ready_to_send().await {
-            Ok(()) => self.write_frame(opcode, payload).await,
-            Err(e) => (Err(e), payload),
+        if let Err(e) = self.ready_to_feed() {
+            return (Err(e), payload);
+        }
+        match self.queue_data(opcode, payload) {
+            // The caller's buffer is free already.
+            Queued::Copied(payload) => {
+                let result = self.flush().await;
+                (result, payload)
+            }
+            // It comes back with the write.
+            Queued::Segment(segment) => {
+                self.queue_owed();
+                let (result, payload) = self.write_out(Some(segment)).await;
+                let payload = payload.expect("the kept segment comes back");
+                match result {
+                    Ok(()) => (self.flush().await, payload),
+                    Err(e) => (Err(e), payload),
+                }
+            }
         }
     }
 
-    /// Flush what is owed, then check we may still send.
-    async fn ready_to_send(&mut self) -> io::Result<()> {
-        self.flush().await?;
+    /// Start the closing handshake, or finish it if the peer started it.
+    /// Keep reading until `None` to see the peer's reply. Idempotent.
+    pub async fn close(&mut self, frame: Option<CloseFrame>) -> io::Result<()> {
+        self.queue_owed();
+        if !self.close_sent {
+            self.queue_close(frame);
+        }
+        self.flush().await
+    }
+
+    /// Queue what reading left owed, then check we may still send.
+    fn ready_to_feed(&mut self) -> io::Result<()> {
+        self.ensure_intact()?;
+        self.queue_owed();
         if self.close_sent {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -208,38 +365,15 @@ impl<T: Transport> WebSocket<T> {
         Ok(())
     }
 
-    /// Send what reading left owed: the pong to the latest ping, and the
-    /// close reply or protocol-error close.
-    pub async fn flush(&mut self) -> io::Result<()> {
-        if let Some(payload) = self.pending_pong.take() {
-            self.write_control(OpCode::Pong, payload).await?;
+    /// The pong to the latest ping, then the close reply or protocol-error
+    /// close, which must come last.
+    fn queue_owed(&mut self) {
+        while let Some(payload) = self.pending_pongs.pop_front() {
+            self.queue_inline(OpCode::Pong, &payload);
         }
         if let Some(frame) = self.pending_close.take() {
-            self.write_close(frame).await?;
+            self.queue_close(frame);
         }
-        Ok(())
-    }
-
-    /// Start the closing handshake, or finish it if the peer started it.
-    /// Keep reading until `None` to see the peer's reply. Idempotent.
-    pub async fn close(&mut self, frame: Option<CloseFrame>) -> io::Result<()> {
-        self.flush().await?;
-        if self.close_sent {
-            return Ok(());
-        }
-        self.write_close(frame).await
-    }
-
-    /// Frame the pooled payload in place and send that very buffer: no
-    /// allocation, no copy. It goes back to the pool once the send is done.
-    async fn write_control(&mut self, opcode: OpCode, payload: ControlBuf) -> io::Result<()> {
-        self.ensure_intact()?;
-        let mask = (self.role == Role::Client).then(random_mask);
-        let frame = payload.into_frame(opcode, mask);
-        self.writing = true;
-        let result = self.transport.send(frame).await.0;
-        self.writing = false;
-        result
     }
 
     fn ensure_intact(&self) -> io::Result<()> {
@@ -252,7 +386,7 @@ impl<T: Transport> WebSocket<T> {
         Ok(())
     }
 
-    async fn write_close(&mut self, frame: Option<CloseFrame>) -> io::Result<()> {
+    fn queue_close(&mut self, frame: Option<CloseFrame>) {
         let mut payload = ControlBuf::new();
         if let Some(CloseFrame { code, reason }) = frame {
             // The reason is cut on a char boundary to fit the 125 bytes.
@@ -263,62 +397,113 @@ impl<T: Transport> WebSocket<T> {
             payload.extend(&code.to_be_bytes());
             payload.extend(&reason.as_bytes()[..end]);
         }
+        self.queue_inline(OpCode::Close, &payload);
         // Past our close frame nothing else may be sent, a pong included.
         self.close_sent = true;
-        self.pending_pong = None;
-        self.write_control(OpCode::Close, payload).await?;
-        if self.close_received {
-            self.transport.shutdown().await?;
-        }
-        Ok(())
+        self.pending_pongs.clear();
+        // The close deadline is sooner than whatever the timer waits for.
+        self.timer = None;
     }
 
-    /// Send one data frame; the payload buffer comes back with the result.
-    async fn write_frame(
-        &mut self,
-        opcode: OpCode,
-        mut payload: Vec<u8>,
-    ) -> (io::Result<()>, Vec<u8>) {
-        if let Err(e) = self.ensure_intact() {
-            return (Err(e), payload);
+    /// Queue a data frame. A small payload is copied into the inline segment
+    /// and handed back; a large one becomes a segment of its own, uncopied,
+    /// whose index comes back instead.
+    fn queue_data(&mut self, opcode: OpCode, mut payload: Vec<u8>) -> Queued {
+        if payload.len() <= INLINE_PAYLOAD {
+            self.queue_inline(opcode, &payload);
+            return Queued::Copied(payload);
         }
         let mask = (self.role == Role::Client).then(random_mask);
         let mut header = [0; MAX_HEADER_LEN];
         let n = encode_header(&mut header, true, opcode, payload.len(), mask);
+        self.inline_segment().extend_from_slice(&header[..n]);
         if let Some(key) = mask {
             apply_mask(&mut payload, key, 0);
         }
-        // Both buffers are lent to the send and come back with its result;
-        // a send cancelled mid-flight keeps them, and poisons the socket anyway.
-        let mut buf = std::mem::take(&mut self.send_buf);
-        buf.clear();
-        buf.extend_from_slice(&header[..n]);
+        self.out_bytes += n + payload.len();
+        self.out.push(payload);
+        // What follows cannot join a segment the caller owns.
+        self.inline_open = false;
+        Queued::Segment(self.out.len() - 1)
+    }
+
+    /// Copy a whole frame into the inline segment, masked there when we are
+    /// a client: the caller's bytes are left as they were.
+    fn queue_inline(&mut self, opcode: OpCode, payload: &[u8]) {
+        let mask = (self.role == Role::Client).then(random_mask);
+        let mut header = [0; MAX_HEADER_LEN];
+        let n = encode_header(&mut header, true, opcode, payload.len(), mask);
+        let segment = self.inline_segment();
+        segment.extend_from_slice(&header[..n]);
+        let start = segment.len();
+        segment.extend_from_slice(payload);
+        if let Some(key) = mask {
+            apply_mask(&mut segment[start..], key, 0);
+        }
+        self.out_bytes += n + payload.len();
+    }
+
+    /// The segment small frames are packed into, opened from the spares if
+    /// the last one is not inline.
+    fn inline_segment(&mut self) -> &mut Vec<u8> {
+        if !self.inline_open {
+            self.out.push(self.spare.pop().unwrap_or_default());
+            self.inline_open = true;
+        }
+        self.out.last_mut().expect("just opened")
+    }
+
+    /// Write every pending segment in one operation. Emptied segments are
+    /// kept for the next frames, except `keep`, the caller's own buffer,
+    /// handed back.
+    async fn write_out(&mut self, keep: Option<usize>) -> (io::Result<()>, Option<Vec<u8>>) {
+        if self.out.is_empty() {
+            return (Ok(()), None);
+        }
+        if let Err(e) = self.ensure_intact() {
+            let kept = keep.map(|i| std::mem::take(&mut self.out[i]));
+            return (Err(e), kept);
+        }
+        let mut out = std::mem::take(&mut self.out);
+        self.inline_open = false;
+        self.out_bytes = 0;
+        // Lent to the write and handed back with its result; a write dropped
+        // mid-flight keeps them, and poisons the socket anyway.
         self.writing = true;
-        let (result, payload) = if payload.len() <= INLINE_PAYLOAD {
-            buf.extend_from_slice(&payload);
-            let (result, buf) = self.transport.send(buf).await;
-            self.send_buf = buf;
-            (result, payload)
+        let result = if out.len() == 1 {
+            let segment = out.pop().expect("one segment");
+            let (result, segment) = self.transport.send(segment).await;
+            out.push(segment);
+            result
         } else {
-            // `buf` carries just the header; the payload goes out uncopied.
-            let mut bufs = std::mem::take(&mut self.send_bufs);
-            bufs.push(buf);
-            bufs.push(payload);
-            let (result, mut bufs) = self.transport.send_vectored(bufs).await;
-            let payload = bufs.pop().expect("payload comes back");
-            self.send_buf = bufs.pop().expect("header buffer comes back");
-            self.send_bufs = bufs;
-            (result, payload)
+            let (result, back) = self.transport.send_vectored(out).await;
+            out = back;
+            result
         };
         self.writing = false;
-        (result, payload)
+        let kept = keep.map(|i| std::mem::take(&mut out[i]));
+        for mut segment in out.drain(..) {
+            if self.spare.len() < MAX_SPARES {
+                segment.clear();
+                // A caller's large payload or a big batch is not worth
+                // holding on to for every connection.
+                segment.shrink_to(SPARE_CAPACITY);
+                self.spare.push(segment);
+            }
+        }
+        // The list itself is kept too, for its capacity.
+        self.out = out;
+        (result, kept)
     }
 
     /// Record what a received message obliges us to send back.
     fn on_message(&mut self, message: &Message) {
         match message {
             Message::Ping(payload) if !self.close_sent => {
-                self.pending_pong = Some(payload.clone());
+                if self.pending_pongs.len() == MAX_PENDING_PONGS {
+                    self.pending_pongs.pop_front();
+                }
+                self.pending_pongs.push_back(payload.clone());
             }
             Message::Close(frame) => {
                 self.close_received = true;
@@ -361,7 +546,7 @@ impl<T: Transport> WebSocket<T> {
 
     fn on_protocol_error(&mut self, e: ProtocolError) {
         self.read_done = true;
-        self.pending_pong = None;
+        self.pending_pongs.clear();
         if !self.close_sent {
             self.pending_close = Some(Some(CloseFrame {
                 code: e.code,
@@ -398,10 +583,17 @@ impl<T: Transport> Stream for WebSocket<T> {
                 this.decode(&bytes);
                 continue;
             }
-            match ready!(this.transport.poll_recv(cx)) {
+            let received = match this.transport.poll_recv(cx) {
+                Poll::Ready(received) => received,
+                Poll::Pending => return this.poll_deadline(cx),
+            };
+            match received {
                 // Decoded whole, then dropped here: the ring buffer is back
                 // with the kernel before any message is handed out.
-                Some(Ok(chunk)) => this.decode(chunk.as_ref()),
+                Some(Ok(chunk)) => {
+                    this.last_received = Some(now());
+                    this.decode(chunk.as_ref());
+                }
                 // Ring pressure, not a failure: the caller polls again later.
                 Some(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     return Poll::Ready(Some(Err(e)));
@@ -422,18 +614,83 @@ impl<T: Transport> Stream for WebSocket<T> {
     }
 }
 
+impl<T: Transport> WebSocket<T> {
+    /// Nothing to read: wait for the nearest deadline, and end the stream
+    /// with `TimedOut` once it passes.
+    fn poll_deadline(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Message>>> {
+        let now = now();
+        let last_received = *self.last_received.get_or_insert(now);
+        let closing = self.close_sent && !self.close_received;
+        if closing {
+            self.closing_since.get_or_insert(now);
+        }
+        let idle = self.config.idle_timeout.map(|d| (last_received + d, false));
+        let close = self
+            .closing_since
+            .filter(|_| closing)
+            .map(|at| (at + self.config.close_timeout, true));
+        let Some((deadline, waiting_for_close)) = [idle, close].into_iter().flatten().min() else {
+            self.timer = None;
+            return Poll::Pending;
+        };
+        let left = deadline.duration_since(now).unwrap_or(Duration::ZERO);
+        if left.is_zero() {
+            return Poll::Ready(Some(Err(self.time_out(waiting_for_close))));
+        }
+        // The wheel ticks every 10 ms; a shorter sleep would only spin.
+        let timer = self
+            .timer
+            .get_or_insert_with(|| Sleep::during(left.max(Duration::from_millis(10))));
+        match Pin::new(timer).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            // Fired: work the deadline out again, as data may have moved it
+            // since the timer was armed; the wheel may also fire a tick early.
+            Poll::Ready(()) => {
+                self.timer = None;
+                self.poll_deadline(cx)
+            }
+        }
+    }
+
+    fn time_out(&mut self, waiting_for_close: bool) -> io::Error {
+        self.read_done = true;
+        self.timer = None;
+        if waiting_for_close {
+            return io::Error::new(io::ErrorKind::TimedOut, "no close frame from the peer");
+        }
+        if !self.close_sent {
+            // Going away: queued like any close, sent on the next flush.
+            self.pending_close = Some(Some(CloseFrame {
+                code: 1001,
+                reason: "idle timeout".to_owned(),
+            }));
+        }
+        io::Error::new(io::ErrorKind::TimedOut, "idle timeout")
+    }
+}
+
+/// The runtime's clock: a thread-local read, cached once per loop turn.
+fn now() -> SystemTime {
+    runtime::runtime::now()
+}
+
+fn elapsed_since(at: SystemTime) -> Duration {
+    now().duration_since(at).unwrap_or(Duration::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::pin;
     use std::task::Waker;
 
     use runtime::net::IoBuf;
+    use runtime_streams::StreamExt;
 
     use super::*;
 
-    /// Records what is sent; never receives.
+    /// Records what is sent, and in how many writes; never receives.
     #[derive(Default)]
-    struct Wire(Vec<u8>);
+    struct Wire(Vec<u8>, usize);
 
     fn bytes<B: IoBuf>(buf: &B) -> &[u8] {
         unsafe { std::slice::from_raw_parts(buf.stable_ptr(), buf.bytes_init()) }
@@ -448,11 +705,13 @@ mod tests {
 
         async fn send<B: IoBuf>(&mut self, buf: B) -> (io::Result<()>, B) {
             self.0.extend_from_slice(bytes(&buf));
+            self.1 += 1;
             (Ok(()), buf)
         }
 
         async fn send_vectored<B: IoBuf>(&mut self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
             bufs.iter().for_each(|b| self.0.extend_from_slice(bytes(b)));
+            self.1 += 1;
             (Ok(()), bufs)
         }
 
@@ -495,46 +754,103 @@ mod tests {
             assert_eq!((text.as_ptr(), text.len()), (text_ptr, 0));
 
             // What went out is what was sent, masked or not.
-            let mut decoder = Decoder::new(role == Role::Client, 1 << 20, 1 << 20);
-            let mut wire = &ws.transport.0[..];
-            let mut received = Vec::new();
-            while !wire.is_empty() {
-                let (n, message) = decoder.feed(wire).unwrap();
-                received.extend(message);
-                wire = &wire[n..];
-            }
-            assert_eq!(received, sent, "{role:?}");
+            assert_eq!(
+                decode_wire(&ws.transport.0, role == Role::Client),
+                sent,
+                "{role:?}"
+            );
         }
     }
 
-    #[test]
-    fn send_buffers_are_reused() {
-        let mut ws =
-            WebSocket::from_upgraded(Wire::default(), Role::Server, vec![], Config::default());
-        let sent = [
-            Message::binary(vec![1; 100]),
-            Message::text("small"),
-            Message::binary(vec![2; 20_000]),
-            Message::binary(vec![3; 30_000]),
-            Message::binary(vec![4; 10]),
-        ];
-        let mut addresses = Vec::new();
-        for message in sent.iter().cloned() {
-            now(ws.send(message)).unwrap();
-            addresses.push((ws.send_buf.as_ptr(), ws.send_bufs.as_ptr()));
-        }
-        // First send allocates; every later one, small or gathered, reuses.
-        assert!(addresses.windows(2).all(|w| w[0] == w[1]), "{addresses:?}");
-        assert!(ws.send_bufs.is_empty());
-
-        let mut decoder = Decoder::new(false, 1 << 20, 1 << 20);
-        let mut wire = &ws.transport.0[..];
+    fn decode_wire(wire: &[u8], masked: bool) -> Vec<Message> {
+        let mut decoder = Decoder::new(masked, 1 << 20, 1 << 20);
+        let mut wire = wire;
         let mut received = Vec::new();
         while !wire.is_empty() {
             let (n, message) = decoder.feed(wire).unwrap();
             received.extend(message);
             wire = &wire[n..];
         }
-        assert_eq!(received, sent);
+        received
+    }
+
+    #[test]
+    fn fed_messages_leave_in_one_write() {
+        for role in [Role::Server, Role::Client] {
+            let mut ws = WebSocket::from_upgraded(Wire::default(), role, vec![], Config::default());
+            // Small ones packed together, a large one uncopied in between,
+            // a control frame, and the pong reading left owed.
+            ws.pending_pongs
+                .push_back(ControlBuf::try_from(b"owed").unwrap());
+            let mut sent = vec![Message::pong(b"owed").unwrap()];
+            sent.extend((0..16).map(|i| Message::binary(vec![i; 64])));
+            sent.push(Message::binary(vec![0xAB; 20_000]));
+            sent.push(Message::text("after the large one"));
+            sent.push(Message::ping(b"p").unwrap());
+            for message in sent[1..].iter().cloned() {
+                now(ws.feed(message)).unwrap();
+            }
+            assert_eq!(ws.transport.1, 0, "{role:?}: feed wrote");
+            now(ws.flush()).unwrap();
+            assert_eq!(ws.transport.1, 1, "{role:?}: not one write");
+            assert_eq!(decode_wire(&ws.transport.0, role == Role::Client), sent);
+        }
+    }
+
+    #[test]
+    fn one_pong_per_ping_up_to_the_cap() {
+        // Twenty masked pings in one read, as a client sends them.
+        let mut wire = Vec::new();
+        for i in 0..20u8 {
+            let mut header = [0; MAX_HEADER_LEN];
+            let key = [9, 8, 7, 6];
+            let n = encode_header(&mut header, true, OpCode::Ping, 1, Some(key));
+            wire.extend_from_slice(&header[..n]);
+            wire.push(i ^ key[0]);
+        }
+        let mut ws =
+            WebSocket::from_upgraded(Wire::default(), Role::Server, wire, Config::default());
+        for i in 0..20u8 {
+            assert_eq!(
+                now(ws.next()).unwrap().unwrap(),
+                Message::ping(&[i]).unwrap()
+            );
+        }
+        now(ws.flush()).unwrap();
+        assert_eq!(ws.transport.1, 1);
+        // The last sixteen, in order: older ones may go unanswered (§5.5.3).
+        let pongs: Vec<_> = (4..20u8).map(|i| Message::pong(&[i]).unwrap()).collect();
+        assert_eq!(decode_wire(&ws.transport.0, false), pongs);
+    }
+
+    #[test]
+    fn feed_writes_past_the_threshold() {
+        let mut ws =
+            WebSocket::from_upgraded(Wire::default(), Role::Server, vec![], Config::default());
+        // 64-byte frames: the threshold is crossed after about a thousand.
+        for _ in 0..2000 {
+            now(ws.feed(Message::binary(vec![1; 62]))).unwrap();
+        }
+        assert!(ws.transport.1 >= 1, "never wrote");
+        assert!(ws.out_bytes < FLUSH_THRESHOLD);
+        now(ws.flush()).unwrap();
+        assert_eq!(decode_wire(&ws.transport.0, false).len(), 2000);
+    }
+
+    #[test]
+    fn segments_are_reused() {
+        let mut ws =
+            WebSocket::from_upgraded(Wire::default(), Role::Server, vec![], Config::default());
+        now(ws.send(Message::binary(vec![1; 100]))).unwrap();
+        let segment = ws.spare[0].as_ptr();
+        for message in [Message::text("small"), Message::binary(vec![2; 10])] {
+            now(ws.send(message)).unwrap();
+            // The inline segment comes back to the spares, not reallocated.
+            assert_eq!(ws.spare.last().unwrap().as_ptr(), segment);
+        }
+        // Spares stay few and small, whatever went through them.
+        now(ws.send(Message::binary(vec![3; 1 << 20]))).unwrap();
+        assert!(ws.spare.len() <= MAX_SPARES);
+        assert!(ws.spare.iter().all(|s| s.capacity() <= SPARE_CAPACITY));
     }
 }

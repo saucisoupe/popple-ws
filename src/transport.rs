@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use popple_tls::{Frame as TlsFrame, KtlsMessages};
+use runtime::io_driver::DEFAULT_QUEUE_SIZE;
 use runtime::io_driver::operations::sockets::multi_recv::{CompletionError, Continuation};
 use runtime::net::{
     BorrowedBuffer, BufRingSpec, IoBuf, MultiRecv, OwnedReadHalf, OwnedWriteHalf, SocketWrapper,
@@ -35,17 +36,22 @@ pub trait Transport {
 
 /// Plain TCP. The socket is split so the multishot recv owns the read half
 /// outright while sends and the half-close go through the write half.
-pub struct Plain<R: BufRingSpec> {
-    recv: MultiRecv<R, OwnedReadHalf>,
+///
+/// `QUEUE` is how many received buffers may wait for this connection before
+/// the recv pauses: buffers the rest of the thread cannot use meanwhile. Size
+/// the ring above the sum of the queues of the connections sharing it, or a
+/// few slow readers starve all the others (`WouldBlock`).
+pub struct Plain<R: BufRingSpec, const QUEUE: usize = DEFAULT_QUEUE_SIZE> {
+    recv: MultiRecv<R, OwnedReadHalf, QUEUE>,
     /// `None` once shut down.
     write: Option<OwnedWriteHalf>,
 }
 
-impl<R: BufRingSpec> Plain<R> {
+impl<R: BufRingSpec, const QUEUE: usize> Plain<R, QUEUE> {
     pub fn new(socket: SocketWrapper) -> Self {
         let (read, write) = socket.into_split();
         Self {
-            recv: MultiRecv::new(read),
+            recv: MultiRecv::with_queue_size(read),
             write: Some(write),
         }
     }
@@ -62,7 +68,7 @@ impl<R: BufRingSpec> Plain<R> {
     }
 }
 
-impl<R: BufRingSpec> Transport for Plain<R> {
+impl<R: BufRingSpec, const QUEUE: usize> Transport for Plain<R, QUEUE> {
     type Chunk = BorrowedBuffer<R>;
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Self::Chunk>>> {

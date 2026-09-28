@@ -1,16 +1,17 @@
+use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use popple_tls::{
     ServerName, ServerSettings, client_config_dangerous_no_verification, server_config,
 };
 use popple_ws::{
-    CloseFrame, Config, HandshakeError, Message, Plain, Tls, Transport, Upgrade, WebSocket,
-    connect, connect_tls,
+    CloseFrame, Config, HandshakeError, Message, Plain, SendError, Tls, Transport, Upgrade,
+    WebSocket, connect, connect_tls,
 };
 use rcgen::{CertificateParams, KeyPair};
 use runtime::net::{BufRingSpec, MultiAccept};
-use runtime::runtime::time::Sleep;
+use runtime::runtime::time::{Sleep, timeout};
 use runtime::spawn;
 use runtime_streams::StreamExt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -273,6 +274,243 @@ fn ring_buffer_released_before_message_is_returned() {
         assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("c"));
         server.await;
     });
+}
+
+/// Accept one upgrade by hand, answering with `extra` headers in the 101.
+async fn bare_upgrade(accept: &mut MultiAccept, extra: &str) -> Plain<Ring> {
+    let socket = accept.next().await.unwrap().unwrap();
+    let mut transport = Plain::<Ring>::new(socket);
+    let mut request = Vec::new();
+    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+        let chunk = std::future::poll_fn(|cx| transport.poll_recv(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        request.extend_from_slice(chunk.as_ref());
+    }
+    let request = String::from_utf8(request).unwrap();
+    let key = request
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .unwrap();
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n{extra}\r\n",
+        popple_ws::handshake::accept_key(key)
+    );
+    transport.send(response.into_bytes()).await.0.unwrap();
+    transport
+}
+
+fn quiet(idle: Duration, ping: Option<Duration>) -> Config {
+    Config {
+        idle_timeout: Some(idle),
+        ping_interval: ping,
+        ..Config::default()
+    }
+}
+
+/// A silent peer is dropped after `idle_timeout`, and told why (1001).
+#[test]
+fn silent_peer_times_out() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let config = quiet(Duration::from_millis(300), None);
+            let upgrade = Upgrade::read(Plain::<Ring>::new(socket), config)
+                .await
+                .unwrap();
+            let (_tx, rx) = upgrade.accept().await.unwrap().split(8);
+            let started = Instant::now();
+            let error = rx.recv().await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            started.elapsed()
+        });
+
+        let (mut ws, _) = connect::<Ring>(addr, "localhost", "/", Config::default())
+            .await
+            .unwrap();
+        match ws.next().await.unwrap().unwrap() {
+            Message::Close(Some(frame)) => assert_eq!(frame.code, 1001),
+            other => panic!("expected close 1001, got {other:?}"),
+        }
+        let elapsed = server.await;
+        assert!(
+            (Duration::from_millis(280)..Duration::from_secs(1)).contains(&elapsed),
+            "{elapsed:?}"
+        );
+    });
+}
+
+/// With `split`, a quiet but live peer is pinged and kept past `idle_timeout`.
+#[test]
+fn keepalive_pings_hold_a_quiet_peer() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let config = quiet(Duration::from_millis(500), Some(Duration::from_millis(100)));
+            let upgrade = Upgrade::read(Plain::<Ring>::new(socket), config)
+                .await
+                .unwrap();
+            let (_tx, rx) = upgrade.accept().await.unwrap().split(8);
+            // Ends on the client's close, not on a timeout.
+            while let Some(message) = rx.recv().await {
+                message.unwrap();
+            }
+        });
+
+        let (mut ws, _) = connect::<Ring>(addr, "localhost", "/", Config::default())
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let mut pings = 0;
+        // Sends nothing but pongs, for over twice the server's idle timeout.
+        while started.elapsed() < Duration::from_millis(1200) {
+            match timeout(Duration::from_millis(100), ws.next()).await {
+                Ok(Some(Ok(Message::Ping(_)))) => {
+                    pings += 1;
+                    ws.flush().await.unwrap();
+                }
+                Ok(other) => panic!("{other:?}"),
+                Err(()) => {}
+            }
+        }
+        assert!(pings >= 3, "{pings} pings");
+        ws.close(None).await.unwrap();
+        // A keepalive ping may still be in flight ahead of the close reply.
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Ping(_))) => continue,
+                Some(Ok(Message::Close(_))) => break,
+                other => panic!("expected the close reply, got {other:?}"),
+            }
+        }
+        server.await;
+    });
+}
+
+/// A peer that never answers our close frame is dropped after `close_timeout`.
+#[test]
+fn unanswered_close_times_out() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            // Upgrades, then never reads: our close frame gets no answer.
+            let _transport = bare_upgrade(&mut accept, "").await;
+            Sleep::during(Duration::from_secs(1)).await;
+        });
+
+        let config = Config {
+            close_timeout: Duration::from_millis(200),
+            ..Config::default()
+        };
+        let (mut ws, _) = connect::<Ring>(addr, "localhost", "/", config)
+            .await
+            .unwrap();
+        ws.close(None).await.unwrap();
+        let started = Instant::now();
+        let error = ws.next().await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_millis(180)..Duration::from_millis(900)).contains(&elapsed),
+            "{elapsed:?}"
+        );
+        server.await;
+    });
+}
+
+/// `split` refuses to queue past `max_outbound_bytes`.
+#[test]
+fn outbound_budget_is_enforced() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let config = Config {
+                max_outbound_bytes: 1000,
+                ..Config::default()
+            };
+            let upgrade = Upgrade::read(Plain::<Ring>::new(socket), config)
+                .await
+                .unwrap();
+            let (tx, rx) = upgrade.accept().await.unwrap().split(8);
+            // The driver has not run yet: both messages would sit in the queue.
+            tx.send(Message::Binary(vec![1; 600])).unwrap();
+            match tx.send(Message::Binary(vec![2; 600])) {
+                Err(SendError::Full(Message::Binary(back))) => assert_eq!(back.len(), 600),
+                other => panic!("expected Full, got {other:?}"),
+            }
+            assert_eq!(tx.queued_bytes(), 600);
+            drop(tx);
+            while rx.recv().await.is_some() {}
+        });
+
+        let (mut ws, _) = connect::<Ring>(addr, "localhost", "/", Config::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            Message::Binary(vec![1; 600])
+        );
+        assert!(matches!(ws.next().await, Some(Ok(Message::Close(_)))));
+        // Reading only queues the close reply; without this flush the
+        // server would wait out its close timeout.
+        ws.flush().await.unwrap();
+        server.await;
+    });
+}
+
+/// A server may only name a subprotocol the client offered.
+#[test]
+fn subprotocol_must_be_offered() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let socket = accept.next().await.unwrap().unwrap();
+            let upgrade = Upgrade::read(Plain::<Ring>::new(socket), Config::default())
+                .await
+                .unwrap();
+            assert!(matches!(
+                upgrade.accept_with_protocol(Some("chat")).await,
+                Err(HandshakeError::Invalid(_))
+            ));
+        });
+        assert!(
+            connect::<Ring>(addr, "localhost", "/", Config::default())
+                .await
+                .is_err()
+        );
+        server.await;
+    });
+}
+
+/// The client refuses a server enabling an extension it never offered.
+#[test]
+fn client_refuses_unoffered_extension() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let server = spawn(async move {
+            let _transport = bare_upgrade(
+                &mut accept,
+                "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+            )
+            .await;
+            Sleep::during(Duration::from_millis(200)).await;
+        });
+        let result = connect::<Ring>(addr, "localhost", "/", Config::default()).await;
+        assert!(matches!(result, Err(HandshakeError::Invalid(_))));
+        server.await;
+    });
+}
+
+#[test]
+fn config_rejects_ping_slower_than_idle() {
+    let config = quiet(Duration::from_secs(10), Some(Duration::from_secs(10)));
+    assert!(config.validate().is_err());
+    assert!(Config::default().validate().is_ok());
 }
 
 #[test]

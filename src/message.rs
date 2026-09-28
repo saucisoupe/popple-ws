@@ -30,6 +30,16 @@ impl Message {
         Self::Binary(b.into())
     }
 
+    /// Payload bytes: what a message costs in a queue.
+    pub fn payload_len(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::Binary(data) => data.len(),
+            Self::Ping(payload) | Self::Pong(payload) => payload.len(),
+            Self::Close(frame) => frame.as_ref().map_or(0, |f| 2 + f.reason.len()),
+        }
+    }
+
     /// A ping carrying `payload`, which must fit 125 bytes.
     pub fn ping(payload: &[u8]) -> Result<Self, ControlTooLong> {
         ControlBuf::try_from(payload).map(Self::Ping)

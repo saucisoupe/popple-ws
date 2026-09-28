@@ -18,7 +18,15 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 runtime::define_buf_ring!(Ring, bgid = 1, buffer_size = 16384, ring_size = 1024);
 
 async fn serve<T: Transport + 'static>(transport: T) {
-    let upgrade = match Upgrade::read(transport, Config::default()).await {
+    // Autobahn's 9.* cases send up to 16 MiB: above the defaults, sized for
+    // untrusted peers.
+    let config = Config {
+        max_frame_size: 16 << 20,
+        max_message_size: 64 << 20,
+        max_outbound_bytes: 64 << 20,
+        ..Config::default()
+    };
+    let upgrade = match Upgrade::read(transport, config).await {
         Ok(upgrade) => upgrade,
         Err(e) => return eprintln!("upgrade: {e}"),
     };

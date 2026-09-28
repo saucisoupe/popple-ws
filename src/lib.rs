@@ -32,5 +32,5 @@ pub use control::{ControlBuf, ControlTooLong};
 pub use handshake::{HandshakeError, Head, Upgrade};
 pub use message::{CloseFrame, Message};
 pub use socket::{Config, InvalidConfig, Role, WebSocket};
-pub use split::{WsReceiver, WsSender};
+pub use split::{SendError, WsReceiver, WsSender};
 pub use transport::{Plain, Tls, Transport};

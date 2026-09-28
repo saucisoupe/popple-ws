@@ -90,11 +90,26 @@ impl Head {
             .next()
             .ok_or(HandshakeError::Invalid("empty head"))?
             .to_owned();
+        if !is_field_value(&start_line) {
+            return Err(HandshakeError::Invalid(
+                "control character in the start line",
+            ));
+        }
         let headers = lines
             .map(|line| {
-                line.split_once(':')
-                    .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
-                    .ok_or(HandshakeError::Invalid("malformed header line"))
+                // Lines are split on CRLF only: a lone CR or LF left inside a
+                // value would let it smuggle a header into anything echoing it.
+                if !is_field_value(line) {
+                    return Err(HandshakeError::Invalid("control character in a header"));
+                }
+                // A token right up to the colon: no space before it (RFC 9112
+                // §5.1), no folded continuation line.
+                match line.split_once(':') {
+                    Some((name, value)) if is_token(name) => {
+                        Ok((name.to_owned(), value.trim().to_owned()))
+                    }
+                    _ => Err(HandshakeError::Invalid("malformed header line")),
+                }
             })
             .collect::<Result<_, _>>()?;
         Ok(Self {
@@ -139,11 +154,18 @@ impl<T: Transport> Upgrade<T> {
     /// unsupported version) before the error is returned.
     pub async fn read(mut transport: T, config: Config) -> Result<Self, HandshakeError> {
         let (raw, leftover) = within(&config, read_head(&mut transport)).await?;
-        let head = Head::parse(&raw)?;
-        match validate_request(&head) {
-            Ok(key) => Ok(Self {
+        let checked = match Head::parse(&raw) {
+            Ok(head) => match validate_request(&head, &config) {
+                Ok(key) => Ok((key.to_owned(), head)),
+                Err(refusal) => Err(refusal),
+            },
+            Err(HandshakeError::Invalid(why)) => Err((400, why)),
+            Err(_) => Err((400, "malformed head")),
+        };
+        match checked {
+            Ok((key, head)) => Ok(Self {
                 transport,
-                key: key.to_owned(),
+                key,
                 head,
                 leftover,
                 config,
@@ -154,13 +176,13 @@ impl<T: Transport> Upgrade<T> {
                 } else {
                     ""
                 };
+                let reason = match status {
+                    403 => "Forbidden",
+                    426 => "Upgrade Required",
+                    _ => "Bad Request",
+                };
                 let response = format!(
-                    "HTTP/1.1 {status} {}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n",
-                    if status == 426 {
-                        "Upgrade Required"
-                    } else {
-                        "Bad Request"
-                    },
+                    "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 );
                 let _ = transport.send(response.into_bytes()).await;
                 let _ = transport.shutdown().await;
@@ -171,6 +193,12 @@ impl<T: Transport> Upgrade<T> {
 
     pub fn head(&self) -> &Head {
         &self.head
+    }
+
+    /// The `Origin` a browser sent, e.g. `https://example.com`. Non-browser
+    /// clients usually send none. See `Config::allowed_origins`.
+    pub fn origin(&self) -> Option<&str> {
+        self.head.header("origin")
     }
 
     /// Request target, e.g. `/chat?room=1`.
@@ -193,10 +221,19 @@ impl<T: Transport> Upgrade<T> {
     }
 
     /// Accept, naming the subprotocol picked from [`protocols`](Self::protocols).
+    /// It must be one the client offered (§4.2.2), which also keeps anything
+    /// but a token out of the response.
     pub async fn accept_with_protocol(
         mut self,
         protocol: Option<&str>,
     ) -> Result<WebSocket<T>, HandshakeError> {
+        if let Some(p) = protocol
+            && !(is_token(p) && self.protocols().any(|offered| offered == p))
+        {
+            return Err(HandshakeError::Invalid(
+                "subprotocol not offered by the client",
+            ));
+        }
         let protocol = protocol
             .map(|p| format!("Sec-WebSocket-Protocol: {p}\r\n"))
             .unwrap_or_default();
@@ -214,8 +251,15 @@ impl<T: Transport> Upgrade<T> {
         ))
     }
 
-    /// Refuse the upgrade with an HTTP status, e.g. 401 or 404.
+    /// Refuse the upgrade with an HTTP status, e.g. 401 or 404. `reason` goes
+    /// on the status line, so it may not hold CR, LF or other controls.
     pub async fn reject(mut self, status: u16, reason: &str) -> io::Result<()> {
+        if !(200..=599).contains(&status) || !is_field_value(reason) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reject needs a 2xx-5xx status and a reason without control characters",
+            ));
+        }
         let response =
             format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         self.transport.send(response.into_bytes()).await.0?;
@@ -224,7 +268,7 @@ impl<T: Transport> Upgrade<T> {
 }
 
 /// On failure, the status to answer with and why.
-fn validate_request(head: &Head) -> Result<&str, (u16, &'static str)> {
+fn validate_request<'h>(head: &'h Head, config: &Config) -> Result<&'h str, (u16, &'static str)> {
     let mut start = head.start_line.split(' ');
     if start.next() != Some("GET") {
         return Err((400, "method is not GET"));
@@ -240,6 +284,17 @@ fn validate_request(head: &Head) -> Result<&str, (u16, &'static str)> {
     }
     if head.header("sec-websocket-version") != Some("13") {
         return Err((426, "unsupported Sec-WebSocket-Version"));
+    }
+    // Browsers always send `Origin`; checking it is what stops another site
+    // from riding a user's cookies into this socket.
+    if !config.allowed_origins.is_empty()
+        && let Some(origin) = head.header("origin")
+        && !config
+            .allowed_origins
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(origin))
+    {
+        return Err((403, "origin not allowed"));
     }
     // 16 random bytes in base64.
     match head.header("sec-websocket-key") {
@@ -275,6 +330,7 @@ async fn client_exchange<T: Transport>(
     path: &str,
     headers: &[(&str, &str)],
 ) -> Result<(Head, Vec<u8>), HandshakeError> {
+    validate_client_request(host, path, headers)?;
     let mut nonce = [0; 16];
     aws_lc_rs::rand::fill(&mut nonce).map_err(|_| io::Error::other("system RNG"))?;
     let key = base64(&nonce);
@@ -307,7 +363,75 @@ async fn client_exchange<T: Transport>(
     if head.header("sec-websocket-accept") != Some(accept_key(&key).as_str()) {
         return Err(HandshakeError::Invalid("wrong Sec-WebSocket-Accept"));
     }
+    // We offer no extension, and only the subprotocols the caller listed
+    // (§4.1): a server picking anything else is refused.
+    if head.header("sec-websocket-extensions").is_some() {
+        return Err(HandshakeError::Invalid(
+            "server enabled an extension not offered",
+        ));
+    }
+    if let Some(picked) = head.header("sec-websocket-protocol") {
+        let offered = headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("sec-websocket-protocol"))
+            .flat_map(|(_, v)| v.split(','))
+            .map(str::trim);
+        if !offered.clone().any(|p| p == picked) {
+            return Err(HandshakeError::Invalid(
+                "server picked a subprotocol not offered",
+            ));
+        }
+    }
     Ok((head, leftover))
+}
+
+/// Refuse what would break out of the request line or a header: the caller
+/// may build these from untrusted input.
+fn validate_client_request(
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Result<(), HandshakeError> {
+    let visible = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic());
+    if !visible(host) {
+        return Err(HandshakeError::Invalid("host must be visible ASCII"));
+    }
+    if !path.starts_with('/') || !visible(path) {
+        return Err(HandshakeError::Invalid(
+            "path must start with / and be visible ASCII",
+        ));
+    }
+    for (name, value) in headers {
+        if !is_token(name) || !is_field_value(value) {
+            return Err(HandshakeError::Invalid("malformed extra header"));
+        }
+        const OWN: [&str; 6] = [
+            "host",
+            "upgrade",
+            "connection",
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "sec-websocket-extensions",
+        ];
+        if OWN.iter().any(|own| own.eq_ignore_ascii_case(name)) {
+            return Err(HandshakeError::Invalid(
+                "header set by the handshake itself",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// RFC 9110 token: header names, subprotocols.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// A field value or reason phrase: no CR, LF, NUL or other control but tab.
+fn is_field_value(s: &str) -> bool {
+    s.bytes().all(|b| b == b'\t' || (b >= 0x20 && b != 0x7F))
 }
 
 /// Read up to the blank line ending an HTTP head. Returns the head and the
@@ -393,6 +517,63 @@ mod tests {
     }
 
     #[test]
+    fn refuses_what_could_smuggle_a_header() {
+        let base = "GET / HTTP/1.1\r\nHost: x\r\n";
+        for bad in [
+            // A lone LF or CR inside a value: echoed, it would start a header.
+            "Sec-WebSocket-Protocol: chat\nSet-Cookie: x=1\r\n",
+            "Sec-WebSocket-Protocol: chat\rSet-Cookie: x=1\r\n",
+            "X-Nul: a\0b\r\n",
+            // Space before the colon (RFC 9112 §5.1), and a folded line.
+            "Upgrade : websocket\r\n",
+            " folded continuation\r\n",
+        ] {
+            let raw = format!("{base}{bad}\r\n");
+            assert!(Head::parse(raw.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(Head::parse(format!("{base}X-Tab: a\tb\r\n\r\n").as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn refuses_injection_in_the_client_request() {
+        assert!(validate_client_request("h", "/a\r\nX: y", &[]).is_err());
+        assert!(validate_client_request("h", "/a b", &[]).is_err());
+        assert!(validate_client_request("h", "a", &[]).is_err());
+        assert!(validate_client_request("h\r\nX: y", "/", &[]).is_err());
+        assert!(validate_client_request("h", "/", &[("X", "a\r\nY: b")]).is_err());
+        assert!(validate_client_request("h", "/", &[("X Y", "v")]).is_err());
+        assert!(validate_client_request("h", "/", &[("Sec-WebSocket-Key", "k")]).is_err());
+        assert!(
+            validate_client_request("h:80", "/a?b=c", &[("Authorization", "Bearer t")]).is_ok()
+        );
+    }
+
+    #[test]
+    fn refuses_origins_not_allowed() {
+        let config = Config {
+            allowed_origins: &["https://good.example"],
+            ..Config::default()
+        };
+        let request = |origin: &str| {
+            Head::parse(
+                format!(
+                    "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                     Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     {origin}\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let evil = request("Origin: https://evil.example\r\n");
+        assert_eq!(validate_request(&evil, &config).unwrap_err().0, 403);
+        let good = request("Origin: HTTPS://GOOD.example\r\n");
+        assert!(validate_request(&good, &config).is_ok());
+        // No Origin: not a browser, so not a cross-site request.
+        assert!(validate_request(&request(""), &config).is_ok());
+    }
+
+    #[test]
     fn validates_request() {
         let head = Head::parse(
             b"GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\n\
@@ -400,13 +581,19 @@ mod tests {
               Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(validate_request(&head), Ok("dGhlIHNhbXBsZSBub25jZQ=="));
+        assert_eq!(
+            validate_request(&head, &Config::default()),
+            Ok("dGhlIHNhbXBsZSBub25jZQ==")
+        );
 
         let old = Head::parse(
             b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\
               Sec-WebSocket-Version: 8\r\n\r\n",
         )
         .unwrap();
-        assert_eq!(validate_request(&old).unwrap_err().0, 426);
+        assert_eq!(
+            validate_request(&old, &Config::default()).unwrap_err().0,
+            426
+        );
     }
 }

@@ -10,12 +10,16 @@ TCP or TLS offloaded to the kernel by
   is decoded, before any message is handed out.
 - **One copy per byte.** Each payload byte is copied once, from the ring into
   its message, and unmasked in place.
-- **No allocation on the hot path** once a connection is warm: send buffers are
-  reused, ping/pong/close payloads come from a per-thread pool, and
+- **Batched writes.** `feed` queues frames, small ones packed together and
+  large ones uncopied; `flush` writes them all in one operation, and with
+  kTLS in as few records.
+- **No allocation on the hot path** once a connection is warm: write buffers
+  are reused, ping/pong/close payloads come from a per-thread pool, and
   `send_binary`/`send_text` hand the caller's buffer back.
-- **Hardened against peers:** frame and message size limits checked on the
-  header, allocation that grows only as bytes arrive, a single deadline over
-  the HTTP upgrade, UTF-8 validated as it arrives.
+- **Hardened against peers:** size limits checked on the frame header,
+  allocation that grows only as bytes arrive, deadlines on the upgrade, on
+  idle connections and on the closing handshake, a bounded outgoing queue,
+  strict header parsing, and an optional `Origin` allow-list.
 
 ## Server
 
@@ -35,9 +39,12 @@ runtime::main_thread_with::<Ring, _>(async {
             let mut ws = upgrade.accept().await?;
             while let Some(Ok(message)) = ws.next().await {
                 if let Message::Text(_) | Message::Binary(_) = message {
-                    ws.send(message).await?;
-                } else {
-                    ws.flush().await?; // pongs and the close reply are queued by reading
+                    ws.feed(message).await?; // queued, not written yet
+                }
+                // Once what one read brought in is handled, one write for all
+                // the echoes, with the pongs and close reply reading owes.
+                if !ws.has_ready() {
+                    ws.flush().await?;
                 }
             }
             Ok::<_, Box<dyn std::error::Error>>(())
@@ -70,15 +77,39 @@ directions.
 
 ```rust
 let (tx, rx) = ws.split(32);      // at most 32 incoming messages wait for `rx`
-tx.send(Message::text("hi"));     // never waits
+tx.send(Message::text("hi"))?;    // never waits; `SendError::Full` past the budget
 while let Some(message) = rx.recv().await { /* ... */ }
 ```
 
+The driver feeds a whole batch of outgoing messages before flushing, so they
+leave in one write. It also pings a quiet peer every `ping_interval`, so live connections
+stay under `idle_timeout`. Driving the socket yourself, send your own pings
+(`ws.idle_for()` tells how long it has been quiet), and call `flush` after
+reading: pongs and the close reply only go out then.
+
 ## Configuration
 
-`Config` sets `max_frame_size` (16 MiB), `max_message_size` (64 MiB) and
-`handshake_timeout` (5 s, up to one hour). `Config::validate` checks it
-up front.
+The defaults suit a server facing untrusted peers. Every size limit is also
+memory a single connection may hold, and every duration is up to one hour.
+
+| Field | Default | |
+|---|---|---|
+| `max_frame_size` | 1 MiB | larger frames close the connection with 1009 |
+| `max_message_size` | 4 MiB | across all fragments of a message |
+| `handshake_timeout` | 5 s | one deadline over the whole HTTP upgrade |
+| `idle_timeout` | 60 s | nothing received: close with 1001, `TimedOut` |
+| `ping_interval` | 20 s | keepalive pings from `split` |
+| `close_timeout` | 5 s | wait for the peer's close frame, then drop it |
+| `max_outbound_bytes` | 4 MiB | `split`'s queue for a peer that does not read |
+| `allowed_origins` | any | browser `Origin` allow-list, else 403 |
+
+Servers that authenticate with cookies should set `allowed_origins`: without
+it, any web page can open a socket with the user's cookies. `Config::validate`
+checks a configuration up front.
+
+Each connection may hold up to its receive queue in ring buffers (`Plain<R, 32>`
+by default) while it is not read. Size the buffer ring above the sum of those
+queues, or a few slow connections starve the others on the same thread.
 
 ## Testing
 
@@ -104,6 +135,6 @@ goes out.
 ## Status
 
 Experimental, like the runtime it builds on: Linux only, kernel 6.1 or later,
-and `modprobe tls` for kTLS. Not supported yet: permessage-deflate, idle and
-keepalive timeouts, a bound on `split`'s outgoing queue, and a true split of
-TLS connections (writes go through the driver task).
+and `modprobe tls` for kTLS. Not supported yet: permessage-deflate, a
+configurable receive queue for TLS connections (fixed by popple-tls), and a
+true split of TLS connections (writes go through the driver task).

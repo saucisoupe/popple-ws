@@ -17,7 +17,13 @@ const HOST: &str = "127.0.0.1:9002";
 
 async fn open(path: &str) -> io::Result<WebSocket<Plain<Ring>>> {
     let addr: SocketAddr = HOST.parse().unwrap();
-    connect::<Ring>(addr, HOST, path, Config::default())
+    // Autobahn's 9.* cases send up to 16 MiB: above the defaults.
+    let config = Config {
+        max_frame_size: 16 << 20,
+        max_message_size: 64 << 20,
+        ..Config::default()
+    };
+    connect::<Ring>(addr, HOST, path, config)
         .await
         .map(|(ws, _)| ws)
         .map_err(io::Error::other)

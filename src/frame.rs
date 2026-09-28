@@ -175,6 +175,9 @@ pub struct Decoder {
     utf8_checked: usize,
     /// Payload of the control frame being read, from the pool.
     control: Option<ControlBuf>,
+    /// The first error: every later `feed` returns it, since the state it
+    /// left behind (a half-counted frame) must not be decoded any further.
+    failed: Option<ProtocolError>,
 }
 
 const EMPTY_HEADER: State = State::Header {
@@ -197,12 +200,25 @@ impl Decoder {
             message: Vec::new(),
             utf8_checked: 0,
             control: None,
+            failed: None,
         }
     }
 
     /// Consume from `input` up to the end of the next complete message.
-    /// Returns the bytes consumed and that message, if one completed.
+    /// Returns the bytes consumed and that message, if one completed. After
+    /// an error the decoder is spent: it returns that error from then on.
     pub fn feed(&mut self, input: &[u8]) -> Result<(usize, Option<Message>), ProtocolError> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        let result = self.decode(input);
+        if let Err(e) = result {
+            self.failed = Some(e);
+        }
+        result
+    }
+
+    fn decode(&mut self, input: &[u8]) -> Result<(usize, Option<Message>), ProtocolError> {
         let mut pos = 0;
         loop {
             match &mut self.state {
@@ -622,6 +638,17 @@ mod tests {
         let wire = frame(true, OpCode::Text, &[b'x', 0xC3], None);
         let mut dec = Decoder::new(false, 1 << 20, 1 << 20);
         assert_eq!(dec.feed(&wire).unwrap_err().code, 1007);
+    }
+
+    #[test]
+    fn spent_after_an_error() {
+        let mut dec = Decoder::new(false, 1 << 20, 1 << 20);
+        let err = dec
+            .feed(&frame(true, OpCode::Text, &[0xFF], None))
+            .unwrap_err();
+        // Valid input no longer gets through: the state is not trusted.
+        let valid = frame(true, OpCode::Text, b"ok", None);
+        assert_eq!(dec.feed(&valid).unwrap_err(), err);
     }
 
     #[test]
