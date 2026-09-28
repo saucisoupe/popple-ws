@@ -12,6 +12,7 @@ use crate::control::ControlBuf;
 use crate::frame::{Decoder, MAX_CONTROL_PAYLOAD, MAX_HEADER_LEN, OpCode, ProtocolError};
 use crate::frame::{apply_mask, encode_header};
 use crate::message::{CloseFrame, Message};
+use crate::shutdown::{Shutdown, Tracked};
 use crate::transport::Transport;
 
 /// Payloads up to this size are copied into the inline segment, behind their
@@ -180,6 +181,8 @@ pub struct WebSocket<T: Transport> {
     /// Armed for the nearest deadline; when it fires the deadline is worked
     /// out again, so incoming data never re-arms it.
     timer: Option<Sleep>,
+    /// Set by [`watch`](Self::watch): the connection counts until dropped.
+    shutdown: Option<(Shutdown, Tracked)>,
 }
 
 impl<T: Transport> Unpin for WebSocket<T> {}
@@ -222,7 +225,19 @@ impl<T: Transport> WebSocket<T> {
             last_received: None,
             closing_since: None,
             timer: None,
+            shutdown: None,
         }
+    }
+
+    /// Count this connection in `shutdown` until it is dropped, and with
+    /// [`split`](Self::split), close it with 1001 once `shutdown` triggers.
+    /// Driving it by hand, `select` on [`Shutdown::triggered`] instead.
+    pub fn watch(&mut self, shutdown: &Shutdown) {
+        self.shutdown = Some((shutdown.clone(), shutdown.track()));
+    }
+
+    pub(crate) fn watched(&self) -> Option<&Shutdown> {
+        self.shutdown.as_ref().map(|(shutdown, _)| shutdown)
     }
 
     pub fn config(&self) -> &Config {

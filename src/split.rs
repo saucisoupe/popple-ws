@@ -6,13 +6,13 @@ use std::time::Duration;
 use runtime::channels::{
     BoundedReceiver, BoundedSender, Receiver, Sender, bounded_channel, unbounded_channel,
 };
-use runtime::runtime::select::{SelectResult3, select3};
+use runtime::runtime::select::{SelectResult4, select4};
 use runtime::runtime::time::Sleep;
 use runtime::spawn;
 use runtime_streams::StreamExt;
 
 use crate::control::ControlBuf;
-use crate::message::Message;
+use crate::message::{CloseFrame, Message};
 use crate::socket::WebSocket;
 use crate::transport::Transport;
 
@@ -140,9 +140,11 @@ async fn pump<T: Transport>(
     let ping_interval = ws.config().ping_interval;
     let mut keepalive = ping_interval.map(Sleep::during);
     let mut outbound_open = true;
+    // Built once and kept: a select loop re-polls it without re-registering.
+    let mut stop = ws.watched().map(|shutdown| Box::pin(shutdown.triggered()));
     loop {
         // `next` is cancel-safe, so losing the race to the others costs nothing.
-        let event = select3(
+        let event = select4(
             ws.next(),
             async {
                 match outbound_open {
@@ -156,10 +158,16 @@ async fn pump<T: Transport>(
                     None => std::future::pending().await,
                 }
             },
+            async {
+                match stop.as_mut() {
+                    Some(triggered) => triggered.await,
+                    None => std::future::pending().await,
+                }
+            },
         )
         .await;
         match event {
-            SelectResult3::First(Some(Ok(message))) => {
+            SelectResult4::First(Some(Ok(message))) => {
                 // Pongs owed by what one read brought in leave together, once
                 // its last message is out.
                 if !ws.has_ready() {
@@ -170,13 +178,18 @@ async fn pump<T: Transport>(
                     return ws.close(None).await;
                 }
             }
-            SelectResult3::First(Some(Err(e))) if e.kind() == io::ErrorKind::WouldBlock => {
+            SelectResult4::First(Some(Err(e))) if e.kind() == io::ErrorKind::WouldBlock => {
                 // The ring is drained by other holders on this thread.
                 Sleep::during(Duration::from_millis(1)).await;
             }
-            SelectResult3::First(Some(Err(e))) => return Err(e),
-            SelectResult3::First(None) => return ws.flush().await,
-            SelectResult3::Second(Some(messages)) => {
+            SelectResult4::First(Some(Err(e))) => return Err(e),
+            SelectResult4::First(None) => return ws.flush().await,
+            SelectResult4::Second(Some(messages)) if ws.is_closing() => {
+                // Nothing may follow our close frame: what was queued is dropped.
+                let size: usize = messages.iter().map(Message::payload_len).sum();
+                shared.queued.set(shared.queued.get() - size);
+            }
+            SelectResult4::Second(Some(messages)) => {
                 // The whole batch in one write.
                 for message in messages {
                     let size = message.payload_len();
@@ -186,11 +199,25 @@ async fn pump<T: Transport>(
                 }
                 ws.flush().await?;
             }
-            SelectResult3::Second(None) => {
+            SelectResult4::Second(None) => {
                 outbound_open = false;
                 ws.close(None).await?;
             }
-            SelectResult3::Third(()) => {
+            SelectResult4::Fourth(()) => {
+                // Once only: the future stays ready.
+                stop = None;
+                // Refuse new messages, say goodbye, and keep reading until the
+                // peer answers our close or `close_timeout` passes.
+                shared.done.set(true);
+                if !ws.is_closing() {
+                    ws.close(Some(CloseFrame {
+                        code: 1001,
+                        reason: "server shutting down".to_owned(),
+                    }))
+                    .await?;
+                }
+            }
+            SelectResult4::Third(()) => {
                 let interval = ping_interval.expect("ticks only with an interval");
                 keepalive = Some(Sleep::during(interval));
                 // Only a quiet peer is pinged; its pong resets the idle clock.

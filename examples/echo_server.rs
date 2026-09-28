@@ -1,4 +1,6 @@
-//! Echo server, plain or TLS.
+//! Echo server, plain or TLS, one worker per core, with graceful shutdown:
+//! on SIGTERM or SIGINT it stops accepting, closes every connection with
+//! 1001, and exits once they are all gone.
 //!
 //!   cargo run --example echo_server            # ws://127.0.0.1:9001
 //!   cargo run --example echo_server -- --tls   # wss://127.0.0.1:9001, self-signed
@@ -8,7 +10,7 @@
 use std::time::Duration;
 
 use popple_tls::{ServerSettings, server_config};
-use popple_ws::{Config, Message, Plain, Tls, Transport, Upgrade};
+use popple_ws::{Config, Message, Plain, Shutdown, Tls, Transport, Upgrade};
 use rcgen::{CertificateParams, KeyPair};
 use runtime::net::MultiAccept;
 use runtime::spawn;
@@ -17,7 +19,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 runtime::define_buf_ring!(Ring, bgid = 1, buffer_size = 16384, ring_size = 1024);
 
-async fn serve<T: Transport + 'static>(transport: T) {
+async fn serve<T: Transport + 'static>(transport: T, shutdown: &Shutdown) {
     // Autobahn's 9.* cases send up to 16 MiB: above the defaults, sized for
     // untrusted peers.
     let config = Config {
@@ -31,9 +33,11 @@ async fn serve<T: Transport + 'static>(transport: T) {
         Err(e) => return eprintln!("upgrade: {e}"),
     };
     println!("upgrade to {}", upgrade.path());
-    let Ok(ws) = upgrade.accept().await else {
+    let Ok(mut ws) = upgrade.accept().await else {
         return;
     };
+    // Closed with 1001 by the split driver once the shutdown triggers.
+    ws.watch(shutdown);
     let (tx, rx) = ws.split(32);
     while let Some(message) = rx.recv().await {
         match message {
@@ -65,24 +69,55 @@ fn main() {
         if tls.is_some() { "wss" } else { "ws" }
     );
 
-    runtime::main_thread_with::<Ring, _>(async move {
-        let mut accept = MultiAccept::bind("127.0.0.1:9001".parse().unwrap()).expect("bind");
-        while let Some(socket) = accept.next().await {
-            let Ok(socket) = socket else { continue };
-            match &tls {
-                None => {
-                    spawn(serve(Plain::<Ring>::new(socket)));
-                }
-                Some(cfg) => {
-                    let cfg = cfg.clone();
-                    spawn(async move {
-                        match popple_tls::handshake(socket, cfg, Duration::from_secs(5)).await {
-                            Ok(ktls) => serve(Tls::new(ktls.into_messages::<Ring>())).await,
-                            Err(e) => eprintln!("TLS handshake: {e}"),
-                        }
-                    });
+    runtime::thread_per_core_with::<Ring, _>(move |worker| {
+        let tls = tls.clone();
+        Box::pin(async move {
+            let shutdown = Shutdown::new();
+            // Every worker listens on the port (SO_REUSEPORT); the kernel
+            // spreads the connections.
+            let mut accept = MultiAccept::bind("127.0.0.1:9001".parse().unwrap()).expect("bind");
+            // Ends by itself on SIGTERM or SIGINT, the runtime cancelling the
+            // accept: polled from the worker's root future, it sees that.
+            while let Some(socket) = accept.next().await {
+                let Ok(socket) = socket else { continue };
+                let shutdown = shutdown.clone();
+                // Counted from the accept, so a connection still upgrading
+                // is waited for too.
+                let alive = shutdown.track();
+                match &tls {
+                    None => {
+                        spawn(async move {
+                            serve(Plain::<Ring>::new(socket), &shutdown).await;
+                            drop(alive);
+                        });
+                    }
+                    Some(cfg) => {
+                        let cfg = cfg.clone();
+                        spawn(async move {
+                            match popple_tls::handshake(socket, cfg, Duration::from_secs(5)).await
+                            {
+                                Ok(ktls) => {
+                                    let transport = Tls::new(ktls.into_messages::<Ring>());
+                                    serve(transport, &shutdown).await;
+                                }
+                                Err(e) => eprintln!("TLS handshake: {e}"),
+                            }
+                            drop(alive);
+                        });
+                    }
                 }
             }
-        }
+            // Close the listening socket now: new clients are refused, not
+            // left waiting in its backlog while the rest drains.
+            drop(accept);
+            println!(
+                "worker {}: shutting down, {} connections",
+                worker.thread_id,
+                shutdown.live()
+            );
+            shutdown.trigger();
+            shutdown.drained().await;
+            println!("worker {}: drained", worker.thread_id);
+        })
     });
 }

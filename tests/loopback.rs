@@ -6,8 +6,8 @@ use popple_tls::{
     ServerName, ServerSettings, client_config_dangerous_no_verification, server_config,
 };
 use popple_ws::{
-    CloseFrame, Config, HandshakeError, Message, Plain, SendError, Tls, Transport, Upgrade,
-    WebSocket, connect, connect_tls,
+    CloseFrame, Config, HandshakeError, Message, Plain, SendError, Shutdown, Tls, Transport,
+    Upgrade, WebSocket, connect, connect_tls,
 };
 use rcgen::{CertificateParams, KeyPair};
 use runtime::net::{BufRingSpec, MultiAccept};
@@ -502,6 +502,104 @@ fn client_refuses_unoffered_extension() {
         });
         let result = connect::<Ring>(addr, "localhost", "/", Config::default()).await;
         assert!(matches!(result, Err(HandshakeError::Invalid(_))));
+        server.await;
+    });
+}
+
+/// Serve one connection the way a graceful server does: tracked from the
+/// accept, watched once upgraded, split, echoing until the end.
+async fn serve_watched(accept: &mut MultiAccept, shutdown: Shutdown, config: Config) {
+    let socket = accept.next().await.unwrap().unwrap();
+    let _alive = shutdown.track();
+    let upgrade = Upgrade::read(Plain::<Ring>::new(socket), config)
+        .await
+        .unwrap();
+    let mut ws = upgrade.accept().await.unwrap();
+    ws.watch(&shutdown);
+    let (tx, rx) = ws.split(8);
+    while let Some(Ok(message)) = rx.recv().await {
+        if matches!(message, Message::Text(_) | Message::Binary(_)) {
+            // Refused once the shutdown began: nothing may follow our close.
+            let _ = tx.send(message);
+        }
+    }
+}
+
+/// On shutdown, a watched connection is told to go away (1001), and the
+/// worker is drained as soon as the peer answers.
+#[test]
+fn shutdown_closes_with_1001_and_drains() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let shutdown = Shutdown::new();
+        let server = spawn({
+            let shutdown = shutdown.clone();
+            async move { serve_watched(&mut accept, shutdown, Config::default()).await }
+        });
+
+        let (mut ws, _) = connect::<Ring>(addr, "localhost", "/", Config::default())
+            .await
+            .unwrap();
+        ws.send(Message::text("before")).await.unwrap();
+        assert_eq!(ws.next().await.unwrap().unwrap(), Message::text("before"));
+
+        shutdown.trigger();
+        match ws.next().await.unwrap().unwrap() {
+            Message::Close(Some(frame)) => assert_eq!(frame.code, 1001),
+            other => panic!("expected close 1001, got {other:?}"),
+        }
+        ws.flush().await.unwrap(); // our close reply
+        assert!(ws.next().await.is_none());
+
+        let started = Instant::now();
+        timeout(Duration::from_secs(2), shutdown.drained())
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(shutdown.live(), 0);
+        server.await;
+    });
+}
+
+/// A peer that never answers the 1001 does not hold the shutdown past
+/// `close_timeout`.
+#[test]
+fn shutdown_does_not_wait_past_close_timeout() {
+    runtime::main_thread_with::<Ring, _>(async {
+        let (mut accept, addr) = listener();
+        let shutdown = Shutdown::new();
+        let config = Config {
+            close_timeout: Duration::from_millis(300),
+            ..Config::default()
+        };
+        let server = spawn({
+            let shutdown = shutdown.clone();
+            async move { serve_watched(&mut accept, shutdown, config).await }
+        });
+
+        let (mut ws, _) = connect::<Ring>(addr, "localhost", "/", Config::default())
+            .await
+            .unwrap();
+        // The server is upgraded once it echoes.
+        ws.send(Message::text("ready?")).await.unwrap();
+        ws.next().await.unwrap().unwrap();
+        shutdown.trigger();
+        // Reads the close, but never flushes the reply.
+        assert!(matches!(ws.next().await, Some(Ok(Message::Close(_)))));
+
+        let started = Instant::now();
+        timeout(Duration::from_secs(3), shutdown.drained())
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_millis(250)..Duration::from_secs(1)).contains(&elapsed),
+            "{elapsed:?}"
+        );
         server.await;
     });
 }

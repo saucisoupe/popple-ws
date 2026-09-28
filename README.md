@@ -87,6 +87,35 @@ stay under `idle_timeout`. Driving the socket yourself, send your own pings
 (`ws.idle_for()` tells how long it has been quiet), and call `flush` after
 reading: pongs and the close reply only go out then.
 
+## Graceful shutdown
+
+Under `thread_per_core`, SIGTERM and SIGINT end every `MultiAccept` stream
+polled from a worker's root future. A `Shutdown` per worker then closes the
+live connections with 1001 and waits for them:
+
+```rust
+let shutdown = Shutdown::new();
+while let Some(Ok(socket)) = accept.next().await {   // None on SIGTERM
+    let shutdown = shutdown.clone();
+    let alive = shutdown.track();                    // counted from the accept
+    spawn(async move {
+        let mut ws = /* upgrade */;
+        ws.watch(&shutdown);                          // split() closes it with 1001
+        let (tx, rx) = ws.split(32);
+        /* ... */
+        drop(alive);
+    });
+}
+drop(accept);               // refuse new clients instead of queueing them
+shutdown.trigger();
+shutdown.drained().await;   // each connection bounded by close_timeout
+```
+
+Driving a socket by hand, `select` on `shutdown.triggered()` and call
+`ws.close(..)`. The runtime exits the process 30 s after the signal whatever
+is left, so keep `close_timeout` and `handshake_timeout` well below that.
+`examples/echo_server.rs` does all of this.
+
 ## Configuration
 
 The defaults suit a server facing untrusted peers. Every size limit is also
